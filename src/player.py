@@ -237,27 +237,32 @@ class Player:
         self._kicking = True
         self._backend.kick(direction_body, power_clamped, ball_x_body, ball_y_body)
 
-    def plan_kick(self) -> tuple[float, float] | None:
+    def plan_kick(
+        self, kick_target: tuple[float, float] | None = None,
+    ) -> tuple[float, float] | None:
         """Calculate kick direction and power.
 
-        Aim from the current ball position toward the opponent's goal center.
-        Return ``(kick_direction, kick_power)``, or None when the ball or context
-        is unavailable.
+        Aim from the current ball position toward ``kick_target``, which
+        defaults to the opponent's goal center. Return
+        ``(kick_direction, kick_power)``, or None when the ball or context is
+        unavailable.
         """
         ctx = self.context
         ball = ctx.ball if ctx is not None else None
         if ctx is None or ball is None:
             return None
 
-        kick_target = opponent_goal(ctx)
+        if kick_target is None:
+            kick_target = opponent_goal(ctx)
         kick_direction = angle_to(ball.x, ball.y, *kick_target)
-        kick_target = self._goal_target_for_direction(kick_direction)
+        # The marker shows where the shot crosses the goal line, not the
+        # caller's (possibly deeper) target point.
+        self._draw_kick_target(self._goal_target_for_direction(kick_direction))
         kick_power = (
             KICK_POWER_BACKFIELD if self._in_backfield()
             else KICK_POWER_DEFAULT
         )
 
-        self._draw_kick_target(kick_target)
         return kick_direction, kick_power
 
     def _goal_target_for_direction(
@@ -594,10 +599,10 @@ class Player:
         """Chase the ball and shoot toward ``kick_target`` or the opponent goal.
 
         Kick hysteresis enters below ENTER and exits above EXIT, where EXIT is
-        greater than ENTER, to prevent threshold oscillation. Normal challenges
-        approach the ball directly without avoidance. The chase target lies
-        ``CHASE_BEHIND_M`` behind the ball on the ball-to-goal line, naturally
-        aligning the player for a shot on arrival.
+        greater than ENTER, to prevent threshold oscillation. The chase avoids
+        robots but not the ball. The chase target lies ``CHASE_BEHIND_M`` behind
+        the ball on the ball-to-target line, naturally aligning the player for a
+        shot on arrival, and the same target also sets the shot direction.
         """
         ctx = self.context
         pose = self.pose
@@ -611,7 +616,7 @@ class Player:
         d = dist(pose.x, pose.y, ball.x, ball.y)
         self._kicking = d <= (KICK_EXIT_M if self._kicking else KICK_ENTER_M)
         if self._kicking:
-            kick_plan = self.plan_kick()
+            kick_plan = self.plan_kick(kick_target)
             if kick_plan is None:
                 self.stop()
                 return
@@ -620,7 +625,8 @@ class Player:
         else:
             self.release_kick()
             self.walk_to(
-                _behind_ball(ball.x, ball.y, kick_target, CHASE_BEHIND_M)
+                _behind_ball(ball.x, ball.y, kick_target, CHASE_BEHIND_M),
+                avoid_robots=True,
             )
 
     def guard(self) -> None:
