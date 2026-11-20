@@ -738,7 +738,8 @@ def _pick_wall_slot(
     line_len = math.hypot(lx, ly)
     if line_len < 1e-6:
         return None
-    best, best_key = None, None
+    best: tuple[float, float] | None = None
+    best_key: tuple[float, float] | None = None
     for t in _circle_points_in_field(context, ball, radius):
         if exclude is not None and dist(t[0], t[1], *exclude) < min_separation:
             continue
@@ -748,7 +749,7 @@ def _pick_wall_slot(
             continue                      # Behind the ball blocks nothing.
         perp = abs(px * ly - py * lx) / line_len
         key = (-perp, along)
-        if best is None or key > best_key:
+        if best_key is None or key > best_key:
             best, best_key = t, key
     return best
 
@@ -832,7 +833,7 @@ def _act_opp_set_play(context: Context, players: list[Player], store) -> None:
     for kind, target in assignments:
         if not remaining:
             break
-        if kind == "guard":
+        if kind == "guard" or target is None:
             who = min(remaining, key=lambda p: _player_dist_to_position(p, (gx, gy)))
             remaining.remove(who)
             who.action = "opp_set:guard"
@@ -860,7 +861,8 @@ def _act_opp_set_play(context: Context, players: list[Player], store) -> None:
             p.action = "opp_set:wait"
             p.stop()
             continue
-        target = min(points, key=lambda t: dist(pose.x, pose.y, *t))
+        px, py = pose.x, pose.y
+        target = min(points, key=lambda t: dist(px, py, *t))
         placed.append(target)
         _wall_move(p, context, ball, target)
 

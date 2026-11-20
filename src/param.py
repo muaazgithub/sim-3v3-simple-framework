@@ -206,6 +206,16 @@ KEEPER_INTERCEPT_MIN_SPEED_MPS = 1.2
 # getting the body onto the shot line is the job, so the keeper walks into
 # the ball's path instead of steering around it.
 KEEPER_BLOCK_AVOID_BALL = False
+# When the predicted shot crosses the goal line within this time (s), the
+# keeper lunges: a direct maximum-speed omnidirectional burst at the crossing
+# point, with no turning or avoidance, to throw its body onto the shot line.
+# A fall from the lunge is recovered automatically by the framework.
+KEEPER_LUNGE_TIME_S = 1.0
+# Optional SDK mode name for a real jump or dive save (for example "jump"),
+# triggered when a shot is imminent. The SDK in this repository only
+# documents "walk", so keep None unless the robot firmware confirms such a
+# mode; the velocity lunge above works everywhere.
+KEEPER_JUMP_MODE = None
 
 
 # ======================================================================

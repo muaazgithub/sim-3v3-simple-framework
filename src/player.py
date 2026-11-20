@@ -1099,6 +1099,33 @@ class Player:
                 ctx, home[0], clamp(y_cross, -mouth, mouth), margin=0.3,
             )
             self.action = "guard:intercept"
+            if t_cross <= KEEPER_LUNGE_TIME_S:
+                # Imminent shot. If the robot firmware provides a real
+                # jump/dive save mode, use it; note the mode must return to
+                # walk by itself (like get-up), since ensure_ready requests
+                # walk again on any other mode.
+                if KEEPER_JUMP_MODE:
+                    self.request_mode(KEEPER_JUMP_MODE)
+                    return
+                # Otherwise lunge: a direct maximum-speed omnidirectional
+                # burst at the crossing point — no turn phases, no
+                # avoidance. Throwing the body onto the line matters more
+                # than posture, and the framework recovers a fall for free.
+                dx_l, dy_l = target[0] - pose.x, target[1] - pose.y
+                d_l = math.hypot(dx_l, dy_l)
+                if d_l >= 1e-6:
+                    ux_l, uy_l = dx_l / d_l, dy_l / d_l
+                    cos_t, sin_t = math.cos(pose.theta), math.sin(pose.theta)
+                    self.set_velocity(
+                        MAX_LINEAR * (ux_l * cos_t + uy_l * sin_t),
+                        MAX_LINEAR * (-ux_l * sin_t + uy_l * cos_t),
+                        0.0,
+                    )
+                    debugdraw.line(
+                        [(pose.x, pose.y), (target[0], target[1])],
+                        rgb=(1.0, 0.4, 0.0), ns="keeper_lunge",
+                    )
+                    return
             face = (
                 face_ball if dist(pose.x, pose.y, *target) <= OMNI_DIST
                 else None
