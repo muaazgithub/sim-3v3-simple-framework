@@ -270,7 +270,15 @@ def _act_normal(context: Context, players: list[Player], store) -> None:
 
 
 def _act_our_kickoff(context: Context, players: list[Player], store) -> None:
-    """Lock the nearest kickoff taker, assign a guard, and leave others in support."""
+    """Lock the kickoff taker, pass on the first touch, and keep others clear.
+
+    A goal straight from kickoff does not count, so while the ball is still
+    inside ``KICKOFF_BALL_MOVED_M`` of the kickoff spot the taker passes to a
+    forward point instead of shooting, and only chases and shoots through
+    ``attack()`` after the ball has left that radius. Before the touch,
+    teammates stay out of the center circle and at least ``INACTIVITY_CLEAR_M``
+    from the ball so the inactivity rule cannot bite.
+    """
     if not players:
         return
 
@@ -284,8 +292,21 @@ def _act_our_kickoff(context: Context, players: list[Player], store) -> None:
     if attacker is None:
         return
 
-    attacker.action = "kickoff"
-    attacker.kick(0.1, KICK_POWER_OUR_KICKOFF)
+    ball = context.ball
+    moved = (
+        ball is not None
+        and dist(ball.x, ball.y, 0.0, 0.0) > KICKOFF_BALL_MOVED_M
+    )
+    if moved:
+        attacker.action = "kickoff:attack"
+        attacker.attack()
+    else:
+        # First touch: a pass toward a safe forward point, never the goal.
+        attacker.action = "kickoff:pass"
+        attacker.kick(
+            angle_to(0.0, 0.0, KICKOFF_PASS_X_M, KICKOFF_PASS_Y_M),
+            KICK_POWER_OUR_KICKOFF,
+        )
 
     rest = [p for p in players if p is not attacker]
     if rest:
@@ -294,13 +315,21 @@ def _act_our_kickoff(context: Context, players: list[Player], store) -> None:
         guard.guard()
         rest = [p for p in rest if p is not guard]
 
-    for p in rest:
-        p.action = "stay"
-        p.stop()
+    r = context.field.circle_radius
+    slot_x = -max(r + 0.5, INACTIVITY_CLEAR_M)
+    slots = [(slot_x, 1.8), (slot_x - 0.9, -1.8)]
+    for p, target in zip(rest, slots):
+        p.action = "kickoff:wait"
+        p.move_to_position(target)
 
 
 def _act_opp_kickoff(context: Context, players: list[Player]) -> None:
-    """Guard with one player while the others wait outside the center circle."""
+    """Guard with one player while the others wait clear of ball and circle.
+
+    Waiting slots sit outside the center circle and at least
+    ``INACTIVITY_CLEAR_M`` from the ball so standing there cannot draw the
+    inactivity penalty.
+    """
     if not players:
         return
     gx, gy = own_goal(context)
@@ -309,7 +338,8 @@ def _act_opp_kickoff(context: Context, players: list[Player]) -> None:
 
     rest = [p for p in players if p is not guard]
     r = context.field.circle_radius
-    slots = [(-r - 0.5, 0.0), (-r - 2.0, 0.5)]
+    slot_x = -max(r + 0.5, INACTIVITY_CLEAR_M)
+    slots = [(slot_x, 0.0), (slot_x - 0.9, 0.5)]
     for p, target in zip(rest, slots):
         p.action = "opp_kickoff:ready"
         p.walk_to(target, avoid_ball=True, avoid_robots=True)
@@ -331,10 +361,15 @@ def _act_our_set_play(context: Context, players: list[Player], store) -> None:
 
 
 def _act_opp_set_play(context: Context, players: list[Player], store) -> None:
-    """Retreat directly from the ball; wait until the official phase changes."""
+    """Retreat from the ball until clear, then hold a safe waiting point.
+
+    Every robot keeps more than the 1.45 m referee clearance (with margin)
+    while the set play is live. Because standing still for 10 s with the ball
+    within 3 m draws an inactivity penalty, cleared robots only stop once they
+    are at least ``INACTIVITY_CLEAR_M`` from the ball; inside that radius they
+    keep walking outward to a waiting point on that circle.
+    """
     ball = context.ball
-    # Account for walk_to's arrival tolerance when targeting the 1.5 m boundary.
-    radius = OPP_SET_PLAY_CLEARANCE_M + ARRIVE_DIST
     half_l = context.field.length / 2.0 - OPP_SET_PLAY_FIELD_MARGIN_M
     half_w = context.field.width / 2.0 - OPP_SET_PLAY_FIELD_MARGIN_M
     for p in players:
@@ -343,24 +378,24 @@ def _act_opp_set_play(context: Context, players: list[Player], store) -> None:
         if ball is None or pose is None:
             p.stop()
             continue
-        if dist(pose.x, pose.y, ball.x, ball.y) >= OPP_SET_PLAY_CLEARANCE_M:
+        if dist(pose.x, pose.y, ball.x, ball.y) >= INACTIVITY_CLEAR_M:
             p.stop()
             continue
 
         # The radial exit is shortest. At the field edge, also consider the
-        # retreat circle's intersections with the in-field boundary.
+        # waiting circle's intersections with the in-field boundary.
         outward = angle_to(ball.x, ball.y, pose.x, pose.y)
         candidates = [(
-            ball.x + math.cos(outward) * radius,
-            ball.y + math.sin(outward) * radius,
+            ball.x + math.cos(outward) * INACTIVITY_CLEAR_M,
+            ball.y + math.sin(outward) * INACTIVITY_CLEAR_M,
         )]
         for x in (-half_l, half_l):
-            remaining = radius ** 2 - (x - ball.x) ** 2
+            remaining = INACTIVITY_CLEAR_M ** 2 - (x - ball.x) ** 2
             if remaining >= 0.0:
                 offset = math.sqrt(remaining)
                 candidates.extend((x, ball.y + sign * offset) for sign in (-1.0, 1.0))
         for y in (-half_w, half_w):
-            remaining = radius ** 2 - (y - ball.y) ** 2
+            remaining = INACTIVITY_CLEAR_M ** 2 - (y - ball.y) ** 2
             if remaining >= 0.0:
                 offset = math.sqrt(remaining)
                 candidates.extend((ball.x + sign * offset, y) for sign in (-1.0, 1.0))
@@ -369,8 +404,14 @@ def _act_opp_set_play(context: Context, players: list[Player], store) -> None:
             if t == clamp_inside_field(context, *t, margin=OPP_SET_PLAY_FIELD_MARGIN_M)
         ]
         if not candidates:
-            p.stop()
-            continue
+            # Rare clipped geometry: keep moving radially anyway, standing
+            # still near the ball is the worse outcome.
+            candidates = [clamp_inside_field(
+                context,
+                ball.x + math.cos(outward) * INACTIVITY_CLEAR_M,
+                ball.y + math.sin(outward) * INACTIVITY_CLEAR_M,
+                margin=OPP_SET_PLAY_FIELD_MARGIN_M,
+            )]
 
         px, py = pose.x, pose.y
         target = min(candidates, key=lambda t: dist(px, py, *t))

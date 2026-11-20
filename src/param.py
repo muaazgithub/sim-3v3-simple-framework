@@ -54,7 +54,9 @@ GUARD_FACE_BALL = True
 GUARD_THREAT_ENTER_X = -1.0
 GUARD_THREAT_EXIT_X = -0.7
 
-SUPPORT_DIST_M = 3.0
+# Stand-off distance from the ball. Waiting here means standing still, so keep
+# above the 3 m inactivity line with margin (see INACTIVITY_CLEAR_M).
+SUPPORT_DIST_M = 3.3
 
 # ======================================================================
 # Normal-phase strategy
@@ -74,13 +76,19 @@ KICKOFF_STAGE_M = 2.0
 KICKOFF_FRONT_MARGIN = 0.1
 KICKOFF_LATERAL_TOL = 0.35
 
-CENTER_LEAVE_DIST_M = 0.15 # Distance from center at which the ball counts as moved
+# A goal straight from kickoff does not count: the taker may only shoot once
+# the ball has left this radius around the kickoff spot (referee line is
+# 0.5 m; keep margin). Until then the first touch passes instead of shooting.
+KICKOFF_BALL_MOVED_M = 0.6
+KICKOFF_PASS_X_M = 2.5             # First-touch pass target (field x, m)
+KICKOFF_PASS_Y_M = 2.0             # First-touch pass target (field y, m)
 
-OPP_SET_WALL_DIST_M = 2.0 # Blocking distance during an opponent kickoff
-
-# Opponent set plays: retreat threshold and field boundary margin (m).
-OPP_SET_PLAY_CLEARANCE_M = 1.5
+# Opponent set plays: field boundary margin for retreat targets (m).
 OPP_SET_PLAY_FIELD_MARGIN_M = 0.3
+
+# No-activity rule: standing still for 10 s with the ball within 3 m draws a
+# penalty. Waiting and standby points keep this distance, with margin.
+INACTIVITY_CLEAR_M = 3.2
 
 
 # ======================================================================
