@@ -244,7 +244,8 @@ class Player:
         """Calculate kick direction and power.
 
         Aim from the current ball position toward ``kick_target``, which
-        defaults to the opponent's goal center. Return
+        defaults to the opponent's goal center. A ball deep in our end is
+        cleared upfield instead of shot. Return
         ``(kick_direction, kick_power)``, or None when the ball or context is
         unavailable.
         """
@@ -252,6 +253,9 @@ class Player:
         ball = ctx.ball if ctx is not None else None
         if ctx is None or ball is None:
             return None
+
+        if kick_target is None and self._ball_in_danger():
+            return self._clear_plan(ball)
 
         if kick_target is None:
             kick_target = self._choose_shot_target()
@@ -265,6 +269,29 @@ class Player:
         )
 
         return kick_direction, kick_power
+
+    def _ball_in_danger(self) -> bool:
+        """Return whether the ball sits deep enough in our end to force a clearance.
+
+        Inside this zone the shot staging point would lie between the ball and
+        our goal line, where any miscue risks our own goal.
+        """
+        ctx = self.context
+        ball = ctx.ball if ctx is not None else None
+        if ctx is None or ball is None:
+            return False
+        return ball.x < -ctx.field.length / 2.0 + DEFENSE_DANGER_DEPTH_M
+
+    def _clear_plan(self, ball) -> tuple[float, float]:
+        """Plan an upfield clearance biased toward the nearer open flank.
+
+        The aim point always lies ahead of the ball, so the kick direction can
+        never point back toward our own goal.
+        """
+        lateral = DEFENSE_CLEAR_LATERAL_M * (1.0 if ball.y >= 0.0 else -1.0)
+        target = (ball.x + DEFENSE_CLEAR_RANGE_M, ball.y + lateral)
+        self._draw_kick_target(target)
+        return angle_to(ball.x, ball.y, *target), KICK_POWER_BACKFIELD
 
     def _choose_shot_target(self) -> tuple[float, float]:
         """Pick the aim point inside the opponent's goal with the most room.
@@ -679,8 +706,15 @@ class Player:
             self.kick(kick_direction, kick_power)
         else:
             self.release_kick()
+            if self._ball_in_danger():
+                # Stage upfield of the ball instead of between the ball and
+                # our goal line: any body contact then pushes the ball away
+                # from our goal, never into it.
+                chase = (ball.x + CHASE_BEHIND_M, ball.y)
+            else:
+                chase = _behind_ball(ball.x, ball.y, kick_target, CHASE_BEHIND_M)
             self.walk_to(
-                _behind_ball(ball.x, ball.y, kick_target, CHASE_BEHIND_M),
+                clamp_inside_field(ctx, *chase, margin=CHASE_FIELD_MARGIN_M),
                 avoid_robots=True,
             )
 

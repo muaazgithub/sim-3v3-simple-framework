@@ -44,6 +44,13 @@ ANGULAR_GAIN = 2.0             # Rotation proportional gain
 KICK_ENTER_M = 2.0             # Enter kicking state below this ball distance
 KICK_EXIT_M = 2.5              # Leave kicking state above this ball distance
 CHASE_BEHIND_M = 0.35          # Distance behind the ball while chasing
+CHASE_FIELD_MARGIN_M = 0.3     # Chase targets are clamped this far inside the field
+
+# Danger zone: a ball this deep in our end must be cleared upfield, never
+# staged for a shot, so no approach can push it into our own goal.
+DEFENSE_DANGER_DEPTH_M = 3.5
+DEFENSE_CLEAR_RANGE_M = 6.0    # Clearance aims this far upfield of the ball
+DEFENSE_CLEAR_LATERAL_M = 2.0  # Clearance lateral bias toward the nearer flank
 
 
 # ======================================================================
