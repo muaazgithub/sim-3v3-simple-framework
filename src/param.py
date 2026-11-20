@@ -102,6 +102,14 @@ SET_PLAY_PASS_EDGE_MARGIN_M = 1.0
 # Opponent set plays: field boundary margin for retreat targets (m).
 OPP_SET_PLAY_FIELD_MARGIN_M = 0.3
 
+# Opponent set-play wall: two blockers hold the ball-to-goal lane at these
+# distances from the ball (both beyond the 3 m inactivity line and far above
+# the 1.45 m clearance line), and a third spreads sideways from the near
+# blocker when the goal itself is too close to guard.
+OPP_SET_WALL_NEAR_M = 3.4
+OPP_SET_WALL_FAR_M = 4.6
+OPP_SET_WALL_SPREAD_M = 1.2
+
 # No-activity rule: standing still for 10 s with the ball within 3 m draws a
 # penalty. Waiting and standby points keep this distance, with margin.
 INACTIVITY_CLEAR_M = 3.2

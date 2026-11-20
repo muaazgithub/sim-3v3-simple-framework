@@ -443,71 +443,185 @@ def _act_our_set_play(context: Context, players: list[Player], store) -> None:
         p.support()
 
 
-def _act_opp_set_play(context: Context, players: list[Player], store) -> None:
-    """Retreat from the ball until clear, then hold a safe waiting point.
+def _circle_points_in_field(
+    context: Context, ball, radius: float,
+) -> list[tuple[float, float]]:
+    """In-field points exactly ``radius`` from the ball.
 
-    Every robot keeps more than the 1.45 m referee clearance (with margin)
-    while the set play is live. Because standing still for 10 s with the ball
-    within 3 m draws an inactivity penalty, cleared robots only stop once they
-    are at least ``INACTIVITY_CLEAR_M`` from the ball; inside that radius they
-    keep walking outward to a waiting point on that circle.
+    Returns the circle's intersections with the in-field boundary rectangle;
+    empty when the circle lies entirely outside, which cannot happen for the
+    radii used here on this field.
     """
-    ball = context.ball
     half_l = context.field.length / 2.0 - OPP_SET_PLAY_FIELD_MARGIN_M
     half_w = context.field.width / 2.0 - OPP_SET_PLAY_FIELD_MARGIN_M
-    for p in players:
-        pose = p.pose
-        p.action = "opp_set:wait"
-        if ball is None or pose is None:
-            p.stop()
-            continue
-        if dist(pose.x, pose.y, ball.x, ball.y) >= INACTIVITY_CLEAR_M:
-            p.stop()
-            continue
+    candidates = []
+    # The direct point on the ball-to-goal lane at this radius.
+    gx, gy = own_goal(context)
+    lx, ly = gx - ball.x, gy - ball.y
+    line_len = math.hypot(lx, ly)
+    if line_len >= 1e-6:
+        candidates.append((
+            ball.x + lx / line_len * radius,
+            ball.y + ly / line_len * radius,
+        ))
+    for x in (-half_l, half_l):
+        remaining = radius ** 2 - (x - ball.x) ** 2
+        if remaining >= 0.0:
+            offset = math.sqrt(remaining)
+            candidates.extend((x, ball.y + s * offset) for s in (-1.0, 1.0))
+    for y in (-half_w, half_w):
+        remaining = radius ** 2 - (y - ball.y) ** 2
+        if remaining >= 0.0:
+            offset = math.sqrt(remaining)
+            candidates.extend((ball.x + s * offset, y) for s in (-1.0, 1.0))
+    return [
+        t for t in candidates
+        if t == clamp_inside_field(context, *t, margin=OPP_SET_PLAY_FIELD_MARGIN_M)
+    ]
 
-        # The radial exit is shortest. At the field edge, also consider the
-        # waiting circle's intersections with the in-field boundary.
+
+def _pick_wall_slot(
+    context: Context, ball,
+    radius: float,
+    exclude: tuple[float, float] | None = None,
+    min_separation: float = 0.0,
+) -> tuple[float, float] | None:
+    """Best blocking point on a circle around the ball for our goal's lane.
+
+    Candidates lie ``radius`` from the ball, inside the field, on our goal's
+    side of it. The point hugging the ball-to-goal line wins, so the wall
+    blocks the direct shot or pass rather than open grass.
+    """
+    gx, gy = own_goal(context)
+    lx, ly = gx - ball.x, gy - ball.y
+    line_len = math.hypot(lx, ly)
+    if line_len < 1e-6:
+        return None
+    best, best_key = None, None
+    for t in _circle_points_in_field(context, ball, radius):
+        if exclude is not None and dist(t[0], t[1], *exclude) < min_separation:
+            continue
+        px, py = t[0] - ball.x, t[1] - ball.y
+        along = (px * lx + py * ly) / line_len
+        if along <= 0.0:
+            continue                      # Behind the ball blocks nothing.
+        perp = abs(px * ly - py * lx) / line_len
+        key = (-perp, along)
+        if best is None or key > best_key:
+            best, best_key = t, key
+    return best
+
+
+def _wall_move(p: Player, context: Context, ball, target: tuple[float, float]) -> None:
+    """Send one player to a wall point, retreating radially when too close.
+
+    A player inside the wall circle exits to the nearest point on it, which
+    only ever increases the distance to the ball, so the 1.45 m clearance is
+    never crossed by cutting past the ball.
+    """
+    pose = p.pose
+    if pose is None:
+        p.stop()
+        return
+    if dist(pose.x, pose.y, ball.x, ball.y) < OPP_SET_WALL_NEAR_M:
+        # Inside the wall circle: exit along the ray away from the ball,
+        # which only ever increases the distance to the ball and never
+        # crosses it. When the ray lands outside the field, fall back to the
+        # nearest in-field point on the circle.
         outward = angle_to(ball.x, ball.y, pose.x, pose.y)
-        candidates = [(
-            ball.x + math.cos(outward) * INACTIVITY_CLEAR_M,
-            ball.y + math.sin(outward) * INACTIVITY_CLEAR_M,
-        )]
-        for x in (-half_l, half_l):
-            remaining = INACTIVITY_CLEAR_M ** 2 - (x - ball.x) ** 2
-            if remaining >= 0.0:
-                offset = math.sqrt(remaining)
-                candidates.extend((x, ball.y + sign * offset) for sign in (-1.0, 1.0))
-        for y in (-half_w, half_w):
-            remaining = INACTIVITY_CLEAR_M ** 2 - (y - ball.y) ** 2
-            if remaining >= 0.0:
-                offset = math.sqrt(remaining)
-                candidates.extend((ball.x + sign * offset, y) for sign in (-1.0, 1.0))
-        candidates = [
-            t for t in candidates
-            if t == clamp_inside_field(context, *t, margin=OPP_SET_PLAY_FIELD_MARGIN_M)
-        ]
-        if not candidates:
-            # Rare clipped geometry: keep moving radially anyway, standing
-            # still near the ball is the worse outcome.
-            candidates = [clamp_inside_field(
-                context,
-                ball.x + math.cos(outward) * INACTIVITY_CLEAR_M,
-                ball.y + math.sin(outward) * INACTIVITY_CLEAR_M,
-                margin=OPP_SET_PLAY_FIELD_MARGIN_M,
-            )]
-
-        px, py = pose.x, pose.y
-        target = min(candidates, key=lambda t: dist(px, py, *t))
-        # Short omnidirectional steps follow the retreat line directly.
-        # Do not invoke path avoidance: the movement is away from the ball.
-        length = dist(pose.x, pose.y, *target)
-        ratio = min(1.0, OMNI_DIST / (2.0 * length))
-        step = (
-            pose.x + (target[0] - pose.x) * ratio,
-            pose.y + (target[1] - pose.y) * ratio,
+        radial = clamp_inside_field(
+            context,
+            ball.x + math.cos(outward) * OPP_SET_WALL_NEAR_M,
+            ball.y + math.sin(outward) * OPP_SET_WALL_NEAR_M,
+            margin=OPP_SET_PLAY_FIELD_MARGIN_M,
         )
+        if dist(radial[0], radial[1], ball.x, ball.y) >= INACTIVITY_CLEAR_M:
+            target = radial
+        else:
+            points = _circle_points_in_field(context, ball, OPP_SET_WALL_NEAR_M)
+            if points:
+                target = min(points, key=lambda t: dist(pose.x, pose.y, *t))
         p.action = "opp_set:retreat"
-        p.walk_to(step, face=angle_to(pose.x, pose.y, ball.x, ball.y))
+    else:
+        p.action = "opp_set:wall"
+    p.walk_to(
+        target, face=angle_to(pose.x, pose.y, ball.x, ball.y),
+        avoid_ball=True, avoid_robots=True,
+    )
+
+
+def _act_opp_set_play(context: Context, players: list[Player], store) -> None:
+    """Block the ball-to-goal lane while keeping every rule distance.
+
+    The set-play ball is stationary until the opponent touches it, so instead
+    of scattering, the team forms a wall on the lane toward our goal: one
+    blocker at ``OPP_SET_WALL_NEAR_M``, one at ``OPP_SET_WALL_FAR_M``, and
+    either a keeper or a laterally spread third blocker. Every standing point
+    stays at least ``OPP_SET_WALL_NEAR_M`` from the ball, above both the
+    1.45 m clearance line and the 3 m inactivity line.
+    """
+    ball = context.ball
+    if ball is None:
+        for p in players:
+            p.action = "opp_set:wait"
+            p.stop()
+        return
+
+    gx, gy = own_goal(context)
+    near = _pick_wall_slot(context, ball, OPP_SET_WALL_NEAR_M)
+    far = _pick_wall_slot(context, ball, OPP_SET_WALL_FAR_M)
+    assignments: list[tuple[str, tuple[float, float] | None]] = []
+    if near is not None:
+        assignments.append(("wall", near))
+    if far is not None:
+        assignments.append(("wall", far))
+    if dist(gx, gy, ball.x, ball.y) >= INACTIVITY_CLEAR_M + 0.2:
+        # The keeper's post is clear of the ball, so someone can guard.
+        assignments.append(("guard", None))
+    else:
+        # No legal keeper spot: spread a third blocker wide of the near one.
+        spread = _pick_wall_slot(
+            context, ball, OPP_SET_WALL_NEAR_M,
+            exclude=near, min_separation=OPP_SET_WALL_SPREAD_M,
+        )
+        if spread is not None:
+            assignments.append(("wall", spread))
+
+    remaining = list(players)
+    for kind, target in assignments:
+        if not remaining:
+            break
+        if kind == "guard":
+            who = min(remaining, key=lambda p: _player_dist_to_position(p, (gx, gy)))
+            remaining.remove(who)
+            who.action = "opp_set:guard"
+            who.guard()
+        else:
+            who = min(remaining, key=lambda p: _player_dist_to_position(p, target))
+            remaining.remove(who)
+            _wall_move(who, context, ball, target)
+
+    # Extra players, or no legal slots at all: hold spread-out points on the
+    # near circle so nobody stands inside the rule distances.
+    placed: list[tuple[float, float]] = [
+        t for _, t in assignments if t is not None
+    ]
+    for p in remaining:
+        pose = p.pose
+        if pose is None:
+            p.stop()
+            continue
+        points = [
+            t for t in _circle_points_in_field(context, ball, OPP_SET_WALL_NEAR_M)
+            if all(dist(t[0], t[1], q[0], q[1]) >= OPP_SET_WALL_SPREAD_M for q in placed)
+        ] or _circle_points_in_field(context, ball, OPP_SET_WALL_NEAR_M)
+        if not points:
+            p.action = "opp_set:wait"
+            p.stop()
+            continue
+        target = min(points, key=lambda t: dist(pose.x, pose.y, *t))
+        placed.append(target)
+        _wall_move(p, context, ball, target)
 
 
 def _act_ready(context: Context, players: list[Player]) -> None:
