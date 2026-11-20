@@ -72,6 +72,11 @@ GUARD_TRACK_MARGIN_M = 0.5
 # above the 3 m inactivity line with margin (see INACTIVITY_CLEAR_M).
 SUPPORT_DIST_M = 3.3
 
+# The keeper treats the ball as in enemy possession when the nearest robot to
+# the ball is an opponent by at least this margin (m). The margin adds
+# hysteresis so the verdict cannot flip every frame in a 50/50 race.
+GUARD_POSSESSION_MARGIN_M = 0.25
+
 # ======================================================================
 # Normal-phase strategy
 # ======================================================================
@@ -146,6 +151,38 @@ CIRCLE_MARGIN_M = 0.3
 GOAL_TARGET_DEPTH_M = 0.25              # Kick target depth inside the goal (m)
 # Aim this far inside the near post when the goal center is covered.
 GOAL_CORNER_INSET_M = 0.3
+
+# Aim points scanned across the goal mouth; more samples find narrower open
+# seams between defenders than the old center-and-corners candidate set.
+GOAL_AIM_SAMPLES = 7
+# A shot counts as open only when its line clears every opponent's center by
+# this much (OPPONENT_RADIUS plus margin for kick-direction error).
+SHOT_MIN_CLEARANCE_M = 0.75
+# Do not fire the kick while the planned shot direction points this far off
+# the robot's heading (radians); reposition behind the ball facing the shot
+# instead. A kick fired while facing away sends the ball backward.
+SHOT_MAX_BODY_ERR_RAD = 1.0
+
+# ======================================================================
+# Blocked-lane passing
+# ======================================================================
+
+# Pass power at zero distance plus this much per meter of pass distance,
+# capped at KICK_POWER_PASS_MAX. Full-power passes make robots fall.
+KICK_POWER_PASS_BASE = 2.5
+KICK_POWER_PASS_PER_M = 0.85
+KICK_POWER_PASS_MAX = 8.0
+# Only pass to teammates this far upfield of the ball, so a blocked shot
+# never turns into a pass back toward our own goal.
+PASS_BACKWARD_MARGIN_M = 0.5
+# A pass lane must clear every opponent's center by this much (m).
+PASS_MIN_LANE_CLEAR_M = 0.6
+# Switch pass targets only when the new teammate is clearly closer (m), so
+# the kick direction does not flap between teammates frame to frame.
+PASS_TARGET_SWITCH_M = 0.8
+# Once passing, keep passing until the shot lane reopens by this much above
+# SHOT_MIN_CLEARANCE_M, preventing shot/pass oscillation at the threshold.
+PASS_EXIT_MARGIN_M = 0.25
 
 # ======================================================================
 # Obstacle geometry

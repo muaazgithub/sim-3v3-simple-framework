@@ -129,6 +129,12 @@ class Player:
         self._support_stationary_since: float | None = None
         self._support_last_update_at: float | None = None
 
+        # Cross-frame pass decision state for blocked shots.
+        self._passing: bool = False
+        self._pass_target_id: int | None = None
+        # Cross-frame ball-possession hysteresis for the keeper.
+        self._enemy_possession: bool = False
+
     # ------------------------------------------------------------------
     # State access
     # ------------------------------------------------------------------
@@ -244,7 +250,10 @@ class Player:
         """Calculate kick direction and power.
 
         Aim from the current ball position toward ``kick_target``, which
-        defaults to the opponent's goal center. A ball deep in our end is
+        defaults to the opponent's goal center. With the default target the
+        aim point is scanned across the goal mouth for the widest open gap;
+        when every lane is blocked, the kick becomes a pass to the best open
+        teammate instead of a hopeful center shot. A ball deep in our end is
         cleared upfield instead of shot. Return
         ``(kick_direction, kick_power)``, or None when the ball or context is
         unavailable.
@@ -258,7 +267,23 @@ class Player:
             return self._clear_plan(ball)
 
         if kick_target is None:
-            kick_target = self._choose_shot_target()
+            kick_target, best_clear = self._best_shot_target(ball)
+            # Hysteresis: once passing, stay in pass mode until the shot lane
+            # reopens by PASS_EXIT_MARGIN_M, so the kick task does not flip
+            # between shot and pass while an opponent hovers on the line.
+            if self._passing:
+                blocked = best_clear < SHOT_MIN_CLEARANCE_M + PASS_EXIT_MARGIN_M
+            else:
+                blocked = best_clear < SHOT_MIN_CLEARANCE_M
+            if blocked:
+                pass_plan = self._pass_plan(ball)
+                if pass_plan is not None:
+                    return pass_plan
+                self._passing = False
+            else:
+                self._passing = False
+                self._pass_target_id = None
+
         kick_direction = angle_to(ball.x, ball.y, *kick_target)
         # The marker shows where the shot crosses the goal line, not the
         # caller's (possibly deeper) target point.
@@ -293,30 +318,107 @@ class Player:
         self._draw_kick_target(target)
         return angle_to(ball.x, ball.y, *target), KICK_POWER_BACKFIELD
 
-    def _choose_shot_target(self) -> tuple[float, float]:
-        """Pick the aim point inside the opponent's goal with the most room.
+    def _best_shot_target(
+        self, ball,
+    ) -> tuple[tuple[float, float], float]:
+        """Scan aim points across the goal mouth; return target and clearance.
 
-        Candidates are the goal center and both inner-post corners. The center
-        is usually covered by the keeper, so an unblocked corner wins when one
-        exists; with nothing open the shot falls back to the goal center,
-        because clearing the ball matters more than placement.
+        ``GOAL_AIM_SAMPLES`` points span the mouth between the post insets, so
+        narrow seams between defenders are found, not just the center and the
+        corners. Points the ball cannot reach on a straight line are skipped;
+        among the rest the widest gap past any opponent wins when it clears
+        ``SHOT_MIN_CLEARANCE_M``. With nothing open, the goal center is
+        returned together with the best clearance found, so the caller can
+        fall back to a pass or a hopeful center shot.
         """
         ctx = self.context
-        ball = ctx.ball if ctx is not None else None
         if ctx is None or ball is None:
-            return opponent_goal(ctx)
+            return opponent_goal(ctx), math.inf
 
         goal_x = ctx.field.length / 2.0
-        corner_y = max(ctx.field.goal_width / 2.0 - GOAL_CORNER_INSET_M, 0.0)
-        candidates = [(goal_x, 0.0), (goal_x, corner_y), (goal_x, -corner_y)]
-        open_targets = [
-            t for t in candidates
-            if self._shot_clearance(ball, t) >= OPPONENT_RADIUS
-            and self.kick_can_score(angle_to(ball.x, ball.y, *t))
-        ]
-        if not open_targets:
-            return opponent_goal(ctx)
-        return max(open_targets, key=lambda t: self._shot_clearance(ball, t))
+        half_goal = ctx.field.goal_width / 2.0
+        inset = min(GOAL_CORNER_INSET_M, max(half_goal - 0.05, 0.0))
+        lo, hi = -(half_goal - inset), (half_goal - inset)
+        samples = max(GOAL_AIM_SAMPLES, 1)
+
+        best_target = opponent_goal(ctx)
+        best_clear = -math.inf
+        for k in range(samples):
+            ratio = k / (samples - 1) if samples > 1 else 0.5
+            y = lo + (hi - lo) * ratio
+            direction = angle_to(ball.x, ball.y, goal_x, y)
+            if not self.kick_can_score(direction):
+                continue
+            clear = self._shot_clearance(ball, (goal_x, y))
+            if clear > best_clear:
+                best_clear, best_target = clear, (goal_x, y)
+        if best_clear >= SHOT_MIN_CLEARANCE_M:
+            return best_target, best_clear
+        return opponent_goal(ctx), max(best_clear, 0.0)
+
+    def _pass_plan(self, ball) -> tuple[float, float] | None:
+        """Plan a pass to the best open teammate when the shot is blocked.
+
+        Candidates are teammates with known poses at least
+        ``PASS_BACKWARD_MARGIN_M`` upfield of the ball, never deep inside our
+        defensive danger zone, with a pass lane that clears every opponent by
+        ``PASS_MIN_LANE_CLEAR_M``. The current pass target is kept unless a
+        clearly closer candidate appears, so the kick direction does not flap
+        between teammates. Return ``(kick_direction, kick_power)`` or None
+        when no teammate offers an open lane.
+        """
+        ctx = self.context
+        if ctx is None:
+            return None
+
+        candidates: list[tuple[float, int, float, float]] = []
+        for mate_id, mate in ctx.teammates.items():
+            if mate_id == self.id:
+                continue
+            pose = mate.pose
+            if pose is None:
+                continue
+            # Never pass deep into our defensive danger zone: a blocked shot
+            # must not turn into a pass toward our own goal.
+            if pose.x < -ctx.field.length / 2.0 + DEFENSE_DANGER_DEPTH_M:
+                continue
+            # The pass must go upfield of the ball, never backward.
+            if pose.x < ball.x - PASS_BACKWARD_MARGIN_M:
+                continue
+            if self._shot_clearance(ball, (pose.x, pose.y)) < PASS_MIN_LANE_CLEAR_M:
+                continue
+            candidates.append((
+                dist(ball.x, ball.y, pose.x, pose.y),
+                mate_id, pose.x, pose.y,
+            ))
+        if not candidates:
+            self._pass_target_id = None
+            return None
+
+        candidates.sort()
+        chosen = candidates[0]
+        if self._pass_target_id is not None:
+            current = next(
+                (c for c in candidates if c[1] == self._pass_target_id), None,
+            )
+            if (
+                current is not None
+                and current[0] <= candidates[0][0] + PASS_TARGET_SWITCH_M
+            ):
+                chosen = current
+        self._pass_target_id = chosen[1]
+        self._passing = True
+
+        target = (chosen[2], chosen[3])
+        power = min(
+            KICK_POWER_PASS_MAX,
+            KICK_POWER_PASS_BASE + KICK_POWER_PASS_PER_M * chosen[0],
+        )
+        self._draw_kick_target(target)
+        debugdraw.line(
+            [(ball.x, ball.y), target], rgb=(0.2, 0.8, 1.0), ns="pass_lane",
+        )
+        return angle_to(ball.x, ball.y, *target), power
 
     def _shot_clearance(
         self, ball, target: tuple[float, float],
@@ -390,6 +492,8 @@ class Player:
 
     def release_kick(self) -> None:
         self._kicking = False  # Clear kick hysteresis and cube visualization.
+        self._passing = False  # Ending the kick task also ends the pass mode.
+        self._pass_target_id = None
         if self._backend is None:
             _log.debug("player %d release_kick (no backend)", self.id)
             return
@@ -677,6 +781,22 @@ class Player:
         ty = ay + vy * t
         return tx, ty, dist(pose.x, pose.y, tx, ty), raw_t
 
+    def _chase_align_target(
+        self, ctx: Context, kick_target: tuple[float, float],
+    ) -> tuple[float, float]:
+        """Return the point the chase should align behind the ball toward.
+
+        While a pass is in progress the chase aligns toward the pass target
+        instead of the goal, so the approach geometry matches the planned
+        kick direction and the alignment gate can open sooner.
+        """
+        if self._passing and self._pass_target_id is not None:
+            mate = ctx.teammates.get(self._pass_target_id)
+            pose = mate.pose if mate is not None else None
+            if pose is not None:
+                return (pose.x, pose.y)
+        return kick_target
+
     def attack(self, kick_target: tuple[float, float] | None = None) -> None:
         """Chase the ball and shoot toward ``kick_target`` or the opponent goal.
 
@@ -685,6 +805,13 @@ class Player:
         robots but not the ball. The chase target lies ``CHASE_BEHIND_M`` behind
         the ball on the ball-to-target line, naturally aligning the player for a
         shot on arrival, and the same target also sets the shot direction.
+
+        While the planned shot direction still points farther off the robot's
+        heading than ``SHOT_MAX_BODY_ERR_RAD``, the kick is withheld and the
+        robot repositions behind the ball facing the shot instead: firing
+        sideways or backwards wastes the shot and can turn it into an own
+        goal. With no open shot (``kick_target=None``), ``plan_kick`` returns
+        a pass to the best open teammate instead of a blocked center shot.
         """
         ctx = self.context
         pose = self.pose
@@ -703,7 +830,22 @@ class Player:
                 self.stop()
                 return
             kick_direction, kick_power = kick_plan
-            self.kick(kick_direction, kick_power)
+            body_err = abs(normalize_angle(kick_direction - pose.theta))
+            if body_err <= SHOT_MAX_BODY_ERR_RAD:
+                self.kick(kick_direction, kick_power)
+                return
+            # Misaligned: reposition behind the ball on the shot line and
+            # face the shot direction, so the next frames can fire cleanly.
+            self.release_kick()
+            aim = (
+                ball.x + math.cos(kick_direction),
+                ball.y + math.sin(kick_direction),
+            )
+            chase = _behind_ball(ball.x, ball.y, aim, CHASE_BEHIND_M)
+            self.walk_to(
+                clamp_inside_field(ctx, *chase, margin=CHASE_FIELD_MARGIN_M),
+                face=kick_direction, avoid_robots=True,
+            )
         else:
             self.release_kick()
             if self._ball_in_danger():
@@ -712,20 +854,60 @@ class Player:
                 # from our goal, never into it.
                 chase = (ball.x + CHASE_BEHIND_M, ball.y)
             else:
-                chase = _behind_ball(ball.x, ball.y, kick_target, CHASE_BEHIND_M)
+                align = self._chase_align_target(ctx, kick_target)
+                chase = _behind_ball(ball.x, ball.y, align, CHASE_BEHIND_M)
             self.walk_to(
                 clamp_inside_field(ctx, *chase, margin=CHASE_FIELD_MARGIN_M),
                 avoid_robots=True,
             )
 
-    def guard(self) -> None:
-        """Guard the goal, shading toward the ball's side once threatened.
+    def _enemy_has_ball(self) -> bool:
+        """Update and return whether the nearest robot to the ball is an opponent.
 
-        Away from danger the keeper waits at the goal-area center. When the
-        ball crosses into our half (hysteresis on ``GUARD_THREAT_ENTER_X`` and
-        ``GUARD_THREAT_EXIT_X``) the keeper tracks the ball across the goal
-        mouth, which improves shot blocking and keeps the keeper moving
-        instead of standing inside the 3 m inactivity radius.
+        Possession is a nearest-opponent-versus-nearest-teammate race; the
+        ``GUARD_POSSESSION_MARGIN_M`` hysteresis keeps the verdict from
+        flipping every frame on near ties. Robots with unknown poses are
+        ignored, and with no ball the previous verdict stands.
+        """
+        ctx = self.context
+        ball = ctx.ball if ctx is not None else None
+        if ctx is None or ball is None:
+            return self._enemy_possession
+        opp_d = min(
+            (
+                dist(ball.x, ball.y, o.pose.x, o.pose.y)
+                for o in ctx.opponents.values() if o.pose is not None
+            ),
+            default=math.inf,
+        )
+        team_d = min(
+            (
+                dist(ball.x, ball.y, pose.x, pose.y)
+                for pose in (
+                    t.pose for t in ctx.teammates.values() if t.pose is not None
+                )
+            ),
+            default=math.inf,
+        )
+        if opp_d + GUARD_POSSESSION_MARGIN_M < team_d:
+            self._enemy_possession = True
+        elif team_d + GUARD_POSSESSION_MARGIN_M < opp_d:
+            self._enemy_possession = False
+        return self._enemy_possession
+
+    def guard(self) -> None:
+        """Guard the goal, sprinting back when the opponents have the ball.
+
+        With the ball in enemy possession the keeper runs straight to the
+        goal mouth and tracks the ball's y across it, so a shot or pass
+        toward our goal meets a blocker as early as possible. Facing is only
+        imposed near the blocking spot, so the long run goes straight at
+        maximum walk speed. Away from danger the keeper waits at the
+        goal-area center, and once the ball crosses into our half
+        (hysteresis on ``GUARD_THREAT_ENTER_X`` and ``GUARD_THREAT_EXIT_X``)
+        the keeper tracks the ball across the mouth, which improves shot
+        blocking and keeps the keeper moving instead of standing inside the
+        3 m inactivity radius.
         """
         ctx = self.context
         pose = self.pose
@@ -736,29 +918,39 @@ class Player:
             return
 
         ball = ctx.ball if ctx is not None else None
-        if ball is not None:
-            if ball.x < GUARD_THREAT_ENTER_X:
-                self._guard_threatened = True
-            elif ball.x > GUARD_THREAT_EXIT_X:
-                self._guard_threatened = False
+        face_ball = (
+            angle_to(pose.x, pose.y, ball.x, ball.y)
+            if GUARD_FACE_BALL and ball is not None else 0.0
+        )
 
-        if self._guard_threatened and ball is not None:
+        if ball is not None and self._enemy_has_ball():
             mouth = ctx.field.goal_width / 2.0 + GUARD_TRACK_MARGIN_M
             target = clamp_inside_field(
                 ctx, home[0], clamp(ball.y, -mouth, mouth), margin=0.3,
             )
-            self.action = "guard:track"
+            self.action = "guard:block"
+            face = (
+                face_ball if dist(pose.x, pose.y, *target) <= OMNI_DIST
+                else None
+            )
         else:
-            target = home
-            self.action = "guard:home"
+            if ball is not None:
+                if ball.x < GUARD_THREAT_ENTER_X:
+                    self._guard_threatened = True
+                elif ball.x > GUARD_THREAT_EXIT_X:
+                    self._guard_threatened = False
+            if self._guard_threatened and ball is not None:
+                mouth = ctx.field.goal_width / 2.0 + GUARD_TRACK_MARGIN_M
+                target = clamp_inside_field(
+                    ctx, home[0], clamp(ball.y, -mouth, mouth), margin=0.3,
+                )
+                self.action = "guard:track"
+            else:
+                target = home
+                self.action = "guard:home"
+            face = face_ball
 
         # Face the ball for faster reactions, or the opponent's goal if unseen.
-        face = 0.0
-        if GUARD_FACE_BALL and ball is not None:
-            face = angle_to(
-                pose.x, pose.y, ball.x, ball.y,
-            )
-
         debugdraw.point(
             target[0], target[1], rgb=(0.0, 0.6, 1.0), scale=0.2, ns="guard_home",
         )
