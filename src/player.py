@@ -27,6 +27,7 @@ from .param import *
 from .utils.geom import (
     angle_to,
     clamp,
+    clamp_inside_field,
     dist,
     normalize_angle,
     opponent_goal,
@@ -253,7 +254,7 @@ class Player:
             return None
 
         if kick_target is None:
-            kick_target = opponent_goal(ctx)
+            kick_target = self._choose_shot_target()
         kick_direction = angle_to(ball.x, ball.y, *kick_target)
         # The marker shows where the shot crosses the goal line, not the
         # caller's (possibly deeper) target point.
@@ -264,6 +265,60 @@ class Player:
         )
 
         return kick_direction, kick_power
+
+    def _choose_shot_target(self) -> tuple[float, float]:
+        """Pick the aim point inside the opponent's goal with the most room.
+
+        Candidates are the goal center and both inner-post corners. The center
+        is usually covered by the keeper, so an unblocked corner wins when one
+        exists; with nothing open the shot falls back to the goal center,
+        because clearing the ball matters more than placement.
+        """
+        ctx = self.context
+        ball = ctx.ball if ctx is not None else None
+        if ctx is None or ball is None:
+            return opponent_goal(ctx)
+
+        goal_x = ctx.field.length / 2.0
+        corner_y = max(ctx.field.goal_width / 2.0 - GOAL_CORNER_INSET_M, 0.0)
+        candidates = [(goal_x, 0.0), (goal_x, corner_y), (goal_x, -corner_y)]
+        open_targets = [
+            t for t in candidates
+            if self._shot_clearance(ball, t) >= OPPONENT_RADIUS
+            and self.kick_can_score(angle_to(ball.x, ball.y, *t))
+        ]
+        if not open_targets:
+            return opponent_goal(ctx)
+        return max(open_targets, key=lambda t: self._shot_clearance(ball, t))
+
+    def _shot_clearance(
+        self, ball, target: tuple[float, float],
+    ) -> float:
+        """Return the narrowest gap between the shot line and any opponent.
+
+        The value is the smallest perpendicular distance from an opponent to
+        the ball-to-target segment; opponents beyond the segment are ignored.
+        Infinity means no opponent stands on the line.
+        """
+        ctx = self.context
+        if ctx is None:
+            return math.inf
+        vx, vy = target[0] - ball.x, target[1] - ball.y
+        length2 = vx * vx + vy * vy
+        if length2 < 1e-6:
+            return math.inf
+        length = math.sqrt(length2)
+        best = math.inf
+        for opponent in ctx.opponents.values():
+            pose = opponent.pose
+            if pose is None:
+                continue
+            rx, ry = pose.x - ball.x, pose.y - ball.y
+            t = (rx * vx + ry * vy) / length2
+            if t < 0.0 or t > 1.0:
+                continue
+            best = min(best, abs(rx * vy - ry * vx) / length)
+        return best
 
     def _goal_target_for_direction(
         self, kick_direction: float,
@@ -630,9 +685,13 @@ class Player:
             )
 
     def guard(self) -> None:
-        """Guard from the center of the goal area.
+        """Guard the goal, shading toward the ball's side once threatened.
 
-        Fall back to that position when no active threat is available.
+        Away from danger the keeper waits at the goal-area center. When the
+        ball crosses into our half (hysteresis on ``GUARD_THREAT_ENTER_X`` and
+        ``GUARD_THREAT_EXIT_X``) the keeper tracks the ball across the goal
+        mouth, which improves shot blocking and keeps the keeper moving
+        instead of standing inside the 3 m inactivity radius.
         """
         ctx = self.context
         pose = self.pose
@@ -643,6 +702,21 @@ class Player:
             return
 
         ball = ctx.ball if ctx is not None else None
+        if ball is not None:
+            if ball.x < GUARD_THREAT_ENTER_X:
+                self._guard_threatened = True
+            elif ball.x > GUARD_THREAT_EXIT_X:
+                self._guard_threatened = False
+
+        if self._guard_threatened and ball is not None:
+            mouth = ctx.field.goal_width / 2.0 + GUARD_TRACK_MARGIN_M
+            target = clamp_inside_field(
+                ctx, home[0], clamp(ball.y, -mouth, mouth), margin=0.3,
+            )
+            self.action = "guard:track"
+        else:
+            target = home
+            self.action = "guard:home"
 
         # Face the ball for faster reactions, or the opponent's goal if unseen.
         face = 0.0
@@ -651,11 +725,10 @@ class Player:
                 pose.x, pose.y, ball.x, ball.y,
             )
 
-        self.action = "guard:home"
         debugdraw.point(
-            home[0], home[1], rgb=(0.0, 0.6, 1.0), scale=0.2, ns="guard_home",
+            target[0], target[1], rgb=(0.0, 0.6, 1.0), scale=0.2, ns="guard_home",
         )
-        self.walk_to(home, face=face, avoid_ball=True, avoid_robots=True)
+        self.walk_to(target, face=face, avoid_ball=True, avoid_robots=True)
 
     def support(self) -> None:
         """Support on the ball-to-own-goal line at ``SUPPORT_DIST_M``.
@@ -685,6 +758,28 @@ class Player:
         half_w = ctx.field.width / 2.0 - 0.3
         tx = clamp(tx, -half_l + 0.3, half_l)
         ty = clamp(ty, -half_w, half_w)
+
+        # Clamping near our goal line can pull the point back next to the ball
+        # (goal kicks, pinned balls). Standing there draws the inactivity
+        # penalty, so push the point away from the ball on whichever side
+        # stays inside the field.
+        if dist(tx, ty, bx, by) < INACTIVITY_CLEAR_M:
+            ux_t, uy_t = tx - bx, ty - by
+            norm = math.hypot(ux_t, uy_t)
+            ux_t, uy_t = (
+                (ux_t / norm, uy_t / norm) if norm >= 1e-6 else (-1.0, 0.0)
+            )
+            options = []
+            for sign in (1.0, -1.0):
+                ox = clamp(
+                    bx + sign * ux_t * INACTIVITY_CLEAR_M,
+                    -half_l + 0.3, half_l,
+                )
+                oy = clamp(
+                    by + sign * uy_t * INACTIVITY_CLEAR_M, -half_w, half_w,
+                )
+                options.append((dist(ox, oy, bx, by), ox, oy))
+            _, tx, ty = max(options)
         self.move_to_position((tx, ty))
 
     def take_kickoff(self, kick_target: tuple[float, float] | None = None) -> None:

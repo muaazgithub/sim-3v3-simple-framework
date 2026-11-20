@@ -53,6 +53,9 @@ CHASE_BEHIND_M = 0.35          # Distance behind the ball while chasing
 GUARD_FACE_BALL = True
 GUARD_THREAT_ENTER_X = -1.0
 GUARD_THREAT_EXIT_X = -0.7
+# When threatened, the keeper tracks the ball's y across the goal mouth plus
+# this margin instead of sitting at the goal-area center.
+GUARD_TRACK_MARGIN_M = 0.5
 
 # Stand-off distance from the ball. Waiting here means standing still, so keep
 # above the 3 m inactivity line with margin (see INACTIVITY_CLEAR_M).
@@ -83,6 +86,12 @@ KICKOFF_BALL_MOVED_M = 0.6
 KICKOFF_PASS_X_M = 2.5             # First-touch pass target (field x, m)
 KICKOFF_PASS_Y_M = 2.0             # First-touch pass target (field y, m)
 
+# Indirect free kick: a goal needs a second touch, so the first touch passes
+# this far forward of the spot toward this lateral offset instead of shooting.
+# Spots deep in the opponent half pass toward the nearer flank, never backward.
+SET_PLAY_PASS_AHEAD_M = 2.0
+SET_PLAY_PASS_EDGE_MARGIN_M = 1.0
+
 # Opponent set plays: field boundary margin for retreat targets (m).
 OPP_SET_PLAY_FIELD_MARGIN_M = 0.3
 
@@ -104,6 +113,8 @@ CIRCLE_MARGIN_M = 0.3
 # ======================================================================
 
 GOAL_TARGET_DEPTH_M = 0.25              # Kick target depth inside the goal (m)
+# Aim this far inside the near post when the goal center is covered.
+GOAL_CORNER_INSET_M = 0.3
 
 # ======================================================================
 # Obstacle geometry

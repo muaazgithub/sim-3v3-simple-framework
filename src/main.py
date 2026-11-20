@@ -122,6 +122,8 @@ class SoccerSimAgent(SoccerAgentMixin, AgentBase):
         store.cur_phase = None
         store.kickoff_taker = None    # Locked taker ID, reselected for each kickoff
         store.normal_attacker = None
+        store.set_play_spot = None    # Ball position where the set play started
+        store.set_play_taker = None   # Passer of an indirect free kick
 
     @staticmethod
     def play(context: Context, players: list[Player], store) -> None:
@@ -239,6 +241,28 @@ def _select_closest_attacker(
     return best
 
 
+def _assign_support_roles(context: Context, taker: Player, players: list[Player]) -> None:
+    """Give the players other than ``taker`` a guard and safe waiting spots.
+
+    The player nearest our goal guards; the rest hold waiting slots outside
+    the center circle and at least ``INACTIVITY_CLEAR_M`` from the ball, so
+    standing there cannot draw the inactivity penalty.
+    """
+    rest = [p for p in players if p is not taker]
+    if rest:
+        gx, gy = own_goal(context)
+        guard = min(rest, key=lambda p: _player_dist_to_position(p, (gx, gy)))
+        guard.guard()
+        rest = [p for p in rest if p is not guard]
+
+    r = context.field.circle_radius
+    slot_x = -max(r + 0.5, INACTIVITY_CLEAR_M)
+    slots = [(slot_x, 1.8), (slot_x - 0.9, -1.8)]
+    for p, target in zip(rest, slots):
+        p.action = "wait"
+        p.move_to_position(target)
+
+
 def _act_normal(context: Context, players: list[Player], store) -> None:
     """Assign the nearest player to attack, the next to guard, and others to support.
 
@@ -308,19 +332,7 @@ def _act_our_kickoff(context: Context, players: list[Player], store) -> None:
             KICK_POWER_OUR_KICKOFF,
         )
 
-    rest = [p for p in players if p is not attacker]
-    if rest:
-        gx, gy = own_goal(context)
-        guard = min(rest, key=lambda p: _player_dist_to_position(p, (gx, gy)))
-        guard.guard()
-        rest = [p for p in rest if p is not guard]
-
-    r = context.field.circle_radius
-    slot_x = -max(r + 0.5, INACTIVITY_CLEAR_M)
-    slots = [(slot_x, 1.8), (slot_x - 0.9, -1.8)]
-    for p, target in zip(rest, slots):
-        p.action = "kickoff:wait"
-        p.move_to_position(target)
+    _assign_support_roles(context, attacker, players)
 
 
 def _act_opp_kickoff(context: Context, players: list[Player]) -> None:
@@ -346,18 +358,89 @@ def _act_opp_kickoff(context: Context, players: list[Player]) -> None:
 
 
 def _act_our_set_play(context: Context, players: list[Player], store) -> None:
-    """Dispatch our set play by type. TODO: add strategy; defaults to normal."""
+    """Dispatch our set play by type.
+
+    Direct restarts resume the normal division of labour: the taker attacks,
+    one player guards, and the rest hold safe waiting slots. ``attack()`` aims
+    at the opponent's goal, so the first touch of a throw-in, goal kick, or
+    corner never goes toward our own goal. An indirect free kick needs a
+    second touch before a goal counts, so the taker passes first and, once
+    the ball has left the spot, the nearest teammate provides the second
+    touch while the taker drops back into support.
+    """
+    if not players:
+        return
+
+    ball = context.ball
+    if store.prev_phase != Phase.OUR_SET_PLAY:
+        # Entering the phase: remember the restart spot so "ball moved" is
+        # measured from where the referee placed the ball, and forget any
+        # previous passer.
+        store.set_play_spot = (ball.x, ball.y) if ball is not None else None
+        store.set_play_taker = None
+    elif getattr(store, "set_play_spot", None) is None and ball is not None:
+        store.set_play_spot = (ball.x, ball.y)
+    spot = getattr(store, "set_play_spot", None)
+    if spot is not None:
+        origin = spot
+    elif ball is not None:
+        origin = (ball.x, ball.y)
+    else:
+        origin = (0.0, 0.0)
+
+    moved = (
+        spot is not None and ball is not None
+        and dist(ball.x, ball.y, *spot) > KICKOFF_BALL_MOVED_M
+    )
+
+    taker = _select_closest_attacker(context, players)
     set_play = get_set_play_type(context)
-    if set_play == SetPlay.THROW_IN:
-        _act_normal(context, players, store)
+
+    if set_play != SetPlay.INDIRECT_FREE_KICK:
+        taker.action = "attack"
+        taker.attack()
+        _assign_support_roles(context, taker, players)
         return
-    if set_play == SetPlay.CORNER_KICK:
-        _act_normal(context, players, store)
+
+    former_taker = getattr(store, "set_play_taker", None)
+    if not moved:
+        # First touch must not be a shot: pass forward of the spot.
+        if spot is not None and spot[0] >= KICKOFF_PASS_X_M:
+            pass_target = (
+                min(
+                    spot[0] + SET_PLAY_PASS_AHEAD_M,
+                    context.field.length / 2.0 - SET_PLAY_PASS_EDGE_MARGIN_M,
+                ),
+                KICKOFF_PASS_Y_M if spot[1] >= 0.0 else -KICKOFF_PASS_Y_M,
+            )
+        else:
+            pass_target = (KICKOFF_PASS_X_M, KICKOFF_PASS_Y_M)
+        taker.action = "setplay:pass"
+        taker.kick(
+            angle_to(origin[0], origin[1], *pass_target),
+            KICK_POWER_OUR_KICKOFF,
+        )
+        store.set_play_taker = taker.id
+        _assign_support_roles(context, taker, players)
         return
-    if set_play == SetPlay.GOAL_KICK:
-        _act_normal(context, players, store)
-        return
-    _act_normal(context, players, store)
+
+    # Ball live after the pass: the passer must not re-touch before a
+    # teammate does, so keep him out of attacker selection until the phase
+    # ends. The nearest other player takes the second touch while the passer
+    # and anyone left drop into support.
+    candidates = [p for p in players if p.id != former_taker] or players
+    striker = _select_closest_attacker(context, candidates)
+    striker.action = "attack"
+    striker.attack()
+    rest = [p for p in players if p is not striker]
+    if rest:
+        gx, gy = own_goal(context)
+        guard = min(rest, key=lambda p: _player_dist_to_position(p, (gx, gy)))
+        guard.guard()
+        rest = [p for p in rest if p is not guard]
+    for p in rest:
+        p.action = "support"
+        p.support()
 
 
 def _act_opp_set_play(context: Context, players: list[Player], store) -> None:
