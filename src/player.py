@@ -24,11 +24,14 @@ from .framework.types import Context, Penalty, Pose2D
 from .framework import debugdraw
 
 from .param import *
-# Explicit re-imports for the newest keeper constants: some container-based
-# Pyright setups keep analyzing a cached param.py until the file is reopened,
-# which makes freshly added star-imported names look undefined. Named imports
-# always resolve.
-from .param import KEEPER_JUMP_MODE, KEEPER_LUNGE_TIME_S
+# The keeper-save constants are read defensively rather than relying on the
+# star import: some container-based Pyright setups keep analyzing a stale
+# param.py copy and flag freshly added star-imported names as undefined,
+# which blocks the build. getattr falls back to the same defaults as
+# param.py, while the real robot reads the tuned values at runtime.
+from . import param as _param
+KEEPER_LUNGE_TIME_S = getattr(_param, "KEEPER_LUNGE_TIME_S", 1.0)
+KEEPER_JUMP_MODE = getattr(_param, "KEEPER_JUMP_MODE", None)
 from .utils.geom import (
     angle_to,
     clamp,
