@@ -24,6 +24,11 @@ from .framework.types import Context, Penalty, Pose2D
 from .framework import debugdraw
 
 from .param import *
+# Explicit re-imports for the newest keeper constants: some container-based
+# Pyright setups keep analyzing a cached param.py until the file is reopened,
+# which makes freshly added star-imported names look undefined. Named imports
+# always resolve.
+from .param import KEEPER_JUMP_MODE, KEEPER_LUNGE_TIME_S
 from .utils.geom import (
     angle_to,
     clamp,

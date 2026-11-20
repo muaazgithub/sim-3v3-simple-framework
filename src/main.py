@@ -839,7 +839,12 @@ def _act_opp_set_play(context: Context, players: list[Player], store) -> None:
             who.action = "opp_set:guard"
             who.guard()
         else:
-            who = min(remaining, key=lambda p: _player_dist_to_position(p, target))
+            # Bind the narrowed target as a default argument: Pyright does
+            # not carry loop-variable narrowing into lambda bodies.
+            who = min(
+                remaining,
+                key=lambda p, t=target: _player_dist_to_position(p, t),
+            )
             remaining.remove(who)
             _wall_move(who, context, ball, target)
 
