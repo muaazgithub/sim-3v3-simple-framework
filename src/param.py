@@ -137,6 +137,78 @@ INACTIVITY_CLEAR_M = 3.2
 
 
 # ======================================================================
+# Ball motion estimates
+# ======================================================================
+
+# Exponential smoothing factor for the ball velocity estimate (0..1); higher
+# values trust the newest frame more.
+BALL_VEL_SMOOTHING = 0.45
+# A ball velocity estimate spanning more than this much time is discarded (s);
+# it would mix in the unknown motion during missed detections.
+BALL_VEL_MAX_DT_S = 0.4
+
+
+# ======================================================================
+# Shot selection gate
+# ======================================================================
+
+# Only shoot when the ball is within this fraction of the field length from
+# the opponent goal center; farther out, dribble or pass instead.
+SHOOT_MAX_RANGE_FRAC = 0.55
+# Only shoot when the ball-to-goal direction stays within this angle of the
+# +x axis (radians); acute side angles produce wild shots.
+SHOOT_MAX_ANGLE_RAD = 0.9
+# Do not commit to a shot while the ball moves faster than this (m/s); a kick
+# on a fast rolling ball goes anywhere.
+SHOT_MAX_BALL_SPEED_MPS = 1.0
+
+# Keep the latched aim seam unless another candidate is clearly wider (m).
+AIM_SWITCH_MARGIN_M = 0.3
+
+
+# ======================================================================
+# Dribbling
+# ======================================================================
+
+# Soft kick power for dribble touches; harder kicks lose control of the ball.
+KICK_POWER_DRIBBLE = 3.0
+# A dribble direction must clear obstacles by this much over PLAN_LOOKAHEAD (m).
+DRIBBLE_CLEARANCE_M = 0.45
+
+
+# ======================================================================
+# Tackling
+# ======================================================================
+
+# Within this distance of the ball an opponent counts as holding it (m).
+OPP_BALL_HOLD_DIST_M = 0.9
+
+
+# ======================================================================
+# Normal-play defense positioning
+# ======================================================================
+
+# Enter defensive assignment when the ball crosses this far into our half (m);
+# leave it again only past the exit line (hysteresis).
+DEFEND_ENTER_X_M = -0.5
+DEFEND_EXIT_X_M = 0.5
+# Ball velocity toward our goal that counts as an attacking ball (m/s on x).
+INTERCEPT_MIN_VX_MPS = 0.8
+# Field defenders meet a ball rolling toward our goal this far ahead of it (m).
+INTERCEPT_LEAD_M = 2.0
+# The defending support stands on the ball-to-goal lane this far from the ball
+# (m), beyond the 3 m inactivity line with margin.
+DEFEND_WALL_DIST_M = 3.4
+# The keeper predicts the ball path and sprints to its goal-line crossing
+# point once the ball moves toward our goal at least this fast (m/s).
+KEEPER_INTERCEPT_MIN_SPEED_MPS = 1.2
+# Whether the keeper models the ball as an obstacle while blocking. False:
+# getting the body onto the shot line is the job, so the keeper walks into
+# the ball's path instead of steering around it.
+KEEPER_BLOCK_AVOID_BALL = False
+
+
+# ======================================================================
 # Positioning and avoidance
 # ======================================================================
 

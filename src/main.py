@@ -122,8 +122,11 @@ class SoccerSimAgent(SoccerAgentMixin, AgentBase):
         store.cur_phase = None
         store.kickoff_taker = None    # Locked taker ID, reselected for each kickoff
         store.normal_attacker = None
+        store.normal_defending = False  # Hysteresis for the defensive assignment
         store.set_play_spot = None    # Ball position where the set play started
         store.set_play_taker = None   # Passer of an indirect free kick
+        store.prev_ball_t = None      # Timestamp of the previous known ball spot
+        store.ball_vel = None         # Smoothed ball velocity estimate (vx, vy)
 
     @staticmethod
     def play(context: Context, players: list[Player], store) -> None:
@@ -145,6 +148,13 @@ class SoccerSimAgent(SoccerAgentMixin, AgentBase):
             f"phase={phase.value} state={game_state} set={set_play} secondary={secondary_time:.1f}",
             rgb=(1.0, 1.0, 0.0), ns="phase",
         )
+
+        # Publish the shared ball velocity estimate to every player; the
+        # keeper's shot prediction, the field interception, and the shot
+        # gate all read it.
+        ball_vel = getattr(store, "ball_vel", None)
+        for p in players:
+            p.ball_vel = ball_vel
 
         # Handle readiness and retain only players that can act this frame.
         # ensure_ready asynchronously gets up or switches to walk mode without
@@ -194,10 +204,31 @@ class SoccerSimAgent(SoccerAgentMixin, AgentBase):
         for p in players:
             _draw_teammate_marker(p)
 
-        # Remember the ball position so the next frame can tell whether the
-        # ball is rolling; restart strikes are only re-issued on a still ball.
+        # Estimate ball velocity from consecutive known positions, smoothed
+        # to suppress tracking noise. A gap longer than BALL_VEL_MAX_DT_S
+        # (missed detections) invalidates the estimate. Consumers: keeper
+        # shot prediction, field interception, and the shot-stillness gate.
         ball = context.ball
+        now = context.now
+        prev = store.prev_ball
+        prev_t = store.prev_ball_t
+        vel = None
+        if ball is not None and prev is not None and prev_t is not None:
+            dt = now - prev_t
+            if 1e-3 < dt <= BALL_VEL_MAX_DT_S:
+                raw = ((ball.x - prev[0]) / dt, (ball.y - prev[1]) / dt)
+                old = store.ball_vel
+                if old is None:
+                    vel = raw
+                else:
+                    a = BALL_VEL_SMOOTHING
+                    vel = (
+                        a * raw[0] + (1.0 - a) * old[0],
+                        a * raw[1] + (1.0 - a) * old[1],
+                    )
+        store.ball_vel = vel
         store.prev_ball = (ball.x, ball.y) if ball is not None else None
+        store.prev_ball_t = now if ball is not None else None
 
 
 def _clear_normal_sticky(store) -> None:
@@ -284,28 +315,93 @@ def _assign_support_roles(context: Context, taker: Player, players: list[Player]
         p.move_to_position(target)
 
 
-def _act_normal(context: Context, players: list[Player], store) -> None:
-    """Assign the nearest player to attack, the next to guard, and others to support.
+def _opponent_holds_ball(context: Context) -> bool:
+    """Return whether an opponent is close enough to the ball to be holding it.
 
-    ``players`` contains ready players with known poses. Assign and execute
-    their roles directly here.
+    A held ball cannot be won by circling; the attacker should tackle it.
+    """
+    ball = context.ball
+    if ball is None:
+        return False
+    for opponent in context.opponents.values():
+        pose = opponent.pose
+        if pose is None:
+            continue
+        if dist(ball.x, ball.y, pose.x, pose.y) <= OPP_BALL_HOLD_DIST_M:
+            return True
+    return False
+
+
+def _act_normal(context: Context, players: list[Player], store) -> None:
+    """Assign roles for normal play, with a defensive keeper assignment.
+
+    Once the ball threatens our goal (inside our half beyond the hysteresis
+    lines, or rolling toward our goal), the player nearest our goal keeps
+    guarding and is excluded from attacker selection — a defending keeper
+    must never be pulled out of the goal by a chasing role. An opponent
+    holding the ball is tackled instead of circled.
     """
     if not players:
         return
 
+    ball = context.ball
+    vel = getattr(store, "ball_vel", None)
+    toward_goal = (
+        ball is not None and vel is not None and vel[0] < -INTERCEPT_MIN_VX_MPS
+    )
+
+    defending = store.normal_defending
+    if ball is not None:
+        if not defending and (ball.x < DEFEND_ENTER_X_M or toward_goal):
+            defending = True
+        elif defending and ball.x > DEFEND_EXIT_X_M and not toward_goal:
+            defending = False
+    store.normal_defending = defending
+
+    if defending:
+        # Defensive shape: keeper guards, nearest of the rest attacks, the
+        # remaining player supports (lane wall or interception).
+        gx, gy = own_goal(context)
+        keeper = min(players, key=lambda p: _player_dist_to_position(p, (gx, gy)))
+        keeper.action = "defend:keeper"
+        keeper.guard()
+        rest = [p for p in players if p is not keeper]
+
+        attacker = _select_closest_attacker(
+            context, rest, getattr(store, "normal_attacker", None),
+        )
+        store.normal_attacker = attacker.id
+        if _opponent_holds_ball(context):
+            attacker.action = "tackle"
+            attacker.tackle()
+        else:
+            attacker.action = "attack"
+            attacker.attack()
+        for p in rest:
+            if p is attacker:
+                continue
+            p.action = "support"
+            p.support()
+        return
+
+    # Attacking phase: the baseline division of labour.
     attacker = _select_closest_attacker(
         context, players, getattr(store, "normal_attacker", None),
     )
     store.normal_attacker = attacker.id
-    attacker.action = "attack"
-    attacker.attack()
+    if _opponent_holds_ball(context):
+        attacker.action = "tackle"
+        attacker.tackle()
+    else:
+        attacker.action = "attack"
+        attacker.attack()
 
     # The remaining player nearest our goal becomes the guard.
     rest = [p for p in players if p is not attacker]
     if rest:
         gx, gy = own_goal(context)
         guard = min(rest, key=lambda p: _player_dist_to_position(p, (gx, gy)))
-        guard.guard()  
+        guard.guard()
         rest = [p for p in rest if p is not guard]
 
     # All other players support.

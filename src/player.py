@@ -134,6 +134,13 @@ class Player:
         self._pass_target_id: int | None = None
         # Cross-frame ball-possession hysteresis for the keeper.
         self._enemy_possession: bool = False
+        # Latched aim seam so the shot direction stays stable across frames.
+        self._aim_target: tuple[float, float] | None = None
+        # Side memory for the dribble touch direction (1.0 / -1.0 / None).
+        self._dribble_side: float | None = None
+        # Ball velocity estimate for this frame, published by the strategy
+        # in main.py from the shared ball position history.
+        self.ball_vel: tuple[float, float] | None = None
 
     # ------------------------------------------------------------------
     # State access
@@ -271,15 +278,21 @@ class Player:
             # Hysteresis: once passing, stay in pass mode until the shot lane
             # reopens by PASS_EXIT_MARGIN_M, so the kick task does not flip
             # between shot and pass while an opponent hovers on the line.
-            if self._passing:
-                blocked = best_clear < SHOT_MIN_CLEARANCE_M + PASS_EXIT_MARGIN_M
-            else:
-                blocked = best_clear < SHOT_MIN_CLEARANCE_M
-            if blocked:
-                pass_plan = self._pass_plan(ball)
-                if pass_plan is not None:
-                    return pass_plan
+            exit_margin = PASS_EXIT_MARGIN_M if self._passing else 0.0
+            shot_open = best_clear >= SHOT_MIN_CLEARANCE_M + exit_margin
+            # Shot gates: shooting range, angle cone, and a still-enough ball.
+            # Long, acute, or moving-ball attempts are wild; carry or pass.
+            if shot_open and not self._shot_allowed(ball):
+                shot_open = False
+            if not shot_open:
+                if self._passing or best_clear < SHOT_MIN_CLEARANCE_M:
+                    pass_plan = self._pass_plan(ball)
+                    if pass_plan is not None:
+                        return pass_plan
                 self._passing = False
+                dribble_plan = self._dribble_plan(ball)
+                if dribble_plan is not None:
+                    return dribble_plan
             else:
                 self._passing = False
                 self._pass_target_id = None
@@ -289,7 +302,7 @@ class Player:
         # caller's (possibly deeper) target point.
         self._draw_kick_target(self._goal_target_for_direction(kick_direction))
         kick_power = (
-            KICK_POWER_BACKFIELD if self._in_backfield()
+            KICK_POWER_BACKFIELD if self._ball_in_danger()
             else KICK_POWER_DEFAULT
         )
 
@@ -344,8 +357,7 @@ class Player:
         lo, hi = -(half_goal - inset), (half_goal - inset)
         samples = max(GOAL_AIM_SAMPLES, 1)
 
-        best_target = opponent_goal(ctx)
-        best_clear = -math.inf
+        candidates: list[tuple[float, tuple[float, float]]] = []
         for k in range(samples):
             ratio = k / (samples - 1) if samples > 1 else 0.5
             y = lo + (hi - lo) * ratio
@@ -353,10 +365,30 @@ class Player:
             if not self.kick_can_score(direction):
                 continue
             clear = self._shot_clearance(ball, (goal_x, y))
-            if clear > best_clear:
-                best_clear, best_target = clear, (goal_x, y)
+            candidates.append((clear, (goal_x, y)))
+        if not candidates:
+            self._aim_target = None
+            return opponent_goal(ctx), 0.0
+        candidates.sort(key=lambda c: c[0], reverse=True)
+        best_clear, best_target = candidates[0]
+
+        # Hysteresis: keep the latched seam while it still qualifies and no
+        # candidate is clearly wider, so the kick direction does not flicker
+        # between aim points as opponents drift along the line.
+        latched = self._aim_target
+        if latched is not None:
+            latch = next((c for c in candidates if c[1] == latched), None)
+            if (
+                latch is not None
+                and latch[0] >= SHOT_MIN_CLEARANCE_M
+                and latch[0] >= best_clear - AIM_SWITCH_MARGIN_M
+            ):
+                best_clear, best_target = latch
+
         if best_clear >= SHOT_MIN_CLEARANCE_M:
+            self._aim_target = best_target
             return best_target, best_clear
+        self._aim_target = None
         return opponent_goal(ctx), max(best_clear, 0.0)
 
     def _pass_plan(self, ball) -> tuple[float, float] | None:
@@ -422,6 +454,127 @@ class Player:
             [(ball.x, ball.y), target], rgb=(0.2, 0.8, 1.0), ns="pass_lane",
         )
         return angle_to(ball.x, ball.y, *target), power
+
+    def _shot_allowed(self, ball) -> bool:
+        """Return whether position and ball motion allow a shot attempt.
+
+        The ball must be within ``SHOOT_MAX_RANGE_FRAC`` of the field length
+        from the opponent goal center, the shot direction within
+        ``SHOOT_MAX_ANGLE_RAD`` of the +x axis, and the ball slower than
+        ``SHOT_MAX_BALL_SPEED_MPS``. Long or acute attempts and kicks on
+        fast rolling balls spray the ball wildly; carry or pass instead.
+        """
+        ctx = self.context
+        if ctx is None:
+            return False
+        gx, gy = opponent_goal(ctx)
+        if dist(ball.x, ball.y, gx, gy) > SHOOT_MAX_RANGE_FRAC * ctx.field.length:
+            return False
+        if abs(angle_to(ball.x, ball.y, gx, gy)) > SHOOT_MAX_ANGLE_RAD:
+            return False
+        vel = self.ball_vel
+        if vel is not None and math.hypot(vel[0], vel[1]) > SHOT_MAX_BALL_SPEED_MPS:
+            return False
+        return True
+
+    def _dribble_plan(self, ball) -> tuple[float, float] | None:
+        """Plan a soft dribble touch that advances around obstacles.
+
+        Candidate directions fan out from the direct line to the opponent
+        goal; the first candidate on each side whose probe stays clear of
+        robots by ``DRIBBLE_CLEARANCE_M`` wins. The previous slant side is
+        kept until it becomes blocked, so successive touches steer one way
+        around a defender instead of jittering left and right. Returns
+        ``(kick_direction, kick_power)``; even a boxed-in robot keeps the
+        ball moving straight ahead, which beats a hopeful blocked shot.
+        """
+        ctx = self.context
+        if ctx is None:
+            return None
+
+        goal_dir = angle_to(ball.x, ball.y, *opponent_goal(ctx))
+        obstacles = collect_obstacles(
+            ctx, self.id, ball=False, robots=True, goals=False,
+        )
+
+        plus_h: float | None = None
+        minus_h: float | None = None
+        k = 1
+        while k * PLAN_STEP <= PLAN_MAX_OFFSET + 1e-9:
+            offset = k * PLAN_STEP
+            if plus_h is None and _heading_clearance(
+                ball.x, ball.y, goal_dir + offset, obstacles,
+            ) >= DRIBBLE_CLEARANCE_M:
+                plus_h = goal_dir + offset
+            if minus_h is None and _heading_clearance(
+                ball.x, ball.y, goal_dir - offset, obstacles,
+            ) >= DRIBBLE_CLEARANCE_M:
+                minus_h = goal_dir - offset
+            if plus_h is not None and minus_h is not None:
+                break
+            k += 1
+
+        side = self._dribble_side
+        if side == 1.0 and plus_h is not None:
+            chosen, self._dribble_side = plus_h, 1.0
+        elif side == -1.0 and minus_h is not None:
+            chosen, self._dribble_side = minus_h, -1.0
+        elif plus_h is not None:
+            chosen, self._dribble_side = plus_h, 1.0
+        elif minus_h is not None:
+            chosen, self._dribble_side = minus_h, -1.0
+        else:
+            chosen, self._dribble_side = goal_dir, None
+
+        self._draw_kick_target(self._goal_target_for_direction(chosen))
+        return normalize_angle(chosen), KICK_POWER_DRIBBLE
+
+    def tackle(self) -> None:
+        """Go straight at an opponent-held ball and win it back.
+
+        Normal attacking steers around robots, which never wins a ball an
+        opponent is shielding; the tackle walks directly at the ball with
+        avoidance off and, once in kick range, plays the regular
+        ``plan_kick`` decision (clearance, pass, or dribble), so the poke is
+        always safe for our own goal.
+        """
+        ctx = self.context
+        pose = self.pose
+        ball = ctx.ball if ctx is not None else None
+        if ctx is None or ball is None or pose is None:
+            self.stop()
+            return
+
+        d = dist(pose.x, pose.y, ball.x, ball.y)
+        self._kicking = d <= (KICK_EXIT_M if self._kicking else KICK_ENTER_M)
+        if self._kicking:
+            kick_plan = self.plan_kick()
+            if kick_plan is None:
+                self.stop()
+                return
+            kick_direction, kick_power = kick_plan
+            body_err = abs(normalize_angle(kick_direction - pose.theta))
+            if body_err <= SHOT_MAX_BODY_ERR_RAD:
+                self.kick(kick_direction, kick_power)
+                return
+            # Misaligned: get behind the ball facing the poke direction.
+            self.release_kick()
+            aim = (
+                ball.x + math.cos(kick_direction),
+                ball.y + math.sin(kick_direction),
+            )
+            chase = _behind_ball(ball.x, ball.y, aim, CHASE_BEHIND_M)
+            self.walk_to(
+                clamp_inside_field(ctx, *chase, margin=CHASE_FIELD_MARGIN_M),
+                face=kick_direction,
+            )
+        else:
+            self.release_kick()
+            # Approach the ball directly: the opponent shielding it must be
+            # met, not circled.
+            self.walk_to(
+                (ball.x, ball.y), avoid_ball=False, avoid_robots=False,
+            )
 
     def _shot_clearance(
         self, ball, target: tuple[float, float],
@@ -497,6 +650,7 @@ class Player:
         self._kicking = False  # Clear kick hysteresis and cube visualization.
         self._passing = False  # Ending the kick task also ends the pass mode.
         self._pass_target_id = None
+        self._aim_target = None  # The next kick picks its aim seam fresh.
         if self._backend is None:
             _log.debug("player %d release_kick (no backend)", self.id)
             return
@@ -926,7 +1080,31 @@ class Player:
             if GUARD_FACE_BALL and ball is not None else 0.0
         )
 
-        if ball is not None and self._enemy_has_ball():
+        # Predictive intercept: once the ball travels toward our goal fast
+        # enough, sprint to where its path crosses the goal line instead of
+        # chasing its current side of the mouth. Blocking means getting the
+        # body onto the shot line, so the ball is not treated as an obstacle.
+        vel = self.ball_vel
+        if (
+            ball is not None and vel is not None
+            and vel[0] < -INTERCEPT_MIN_VX_MPS
+            and math.hypot(vel[0], vel[1]) >= KEEPER_INTERCEPT_MIN_SPEED_MPS
+        ):
+            vx, vy = vel
+            goal_line_x = -ctx.field.length / 2.0
+            t_cross = (goal_line_x - ball.x) / vx      # vx < 0, so t > 0
+            y_cross = ball.y + vy * t_cross
+            mouth = ctx.field.goal_width / 2.0 + GUARD_TRACK_MARGIN_M
+            target = clamp_inside_field(
+                ctx, home[0], clamp(y_cross, -mouth, mouth), margin=0.3,
+            )
+            self.action = "guard:intercept"
+            face = (
+                face_ball if dist(pose.x, pose.y, *target) <= OMNI_DIST
+                else None
+            )
+            avoid_ball = KEEPER_BLOCK_AVOID_BALL
+        elif ball is not None and self._enemy_has_ball():
             mouth = ctx.field.goal_width / 2.0 + GUARD_TRACK_MARGIN_M
             target = clamp_inside_field(
                 ctx, home[0], clamp(ball.y, -mouth, mouth), margin=0.3,
@@ -936,6 +1114,7 @@ class Player:
                 face_ball if dist(pose.x, pose.y, *target) <= OMNI_DIST
                 else None
             )
+            avoid_ball = KEEPER_BLOCK_AVOID_BALL
         else:
             if ball is not None:
                 if ball.x < GUARD_THREAT_ENTER_X:
@@ -952,17 +1131,23 @@ class Player:
                 target = home
                 self.action = "guard:home"
             face = face_ball
+            avoid_ball = True
 
         # Face the ball for faster reactions, or the opponent's goal if unseen.
         debugdraw.point(
             target[0], target[1], rgb=(0.0, 0.6, 1.0), scale=0.2, ns="guard_home",
         )
-        self.walk_to(target, face=face, avoid_ball=True, avoid_robots=True)
+        self.walk_to(target, face=face, avoid_ball=avoid_ball, avoid_robots=True)
 
     def support(self) -> None:
-        """Support on the ball-to-own-goal line at ``SUPPORT_DIST_M``.
+        """Support the ball-to-own-goal line; block the lane when defending.
 
-        This places the player on a blocking line between the ball and our goal.
+        With the ball in our half the support becomes a second blocker on the
+        ball-to-goal lane at ``DEFEND_WALL_DIST_M``, denying the direct shot.
+        When a ball is rolling toward our goal fast enough, the support meets
+        it on its path ``INTERCEPT_LEAD_M`` ahead instead of waiting on the
+        lane. With the ball in the opponent half it holds the classic support
+        spot at ``SUPPORT_DIST_M`` from the ball.
         """
         ctx = self.context
         ball = ctx.ball if ctx is not None else None
@@ -978,7 +1163,26 @@ class Player:
             ux, uy = -1.0, 0.0
         else:
             ux, uy = dx / d, dy / d
-        along = min(SUPPORT_DIST_M, d)
+
+        vel = self.ball_vel
+        if (
+            ball.x < 0.0 and vel is not None
+            and vel[0] < -INTERCEPT_MIN_VX_MPS
+            and math.hypot(vel[0], vel[1]) >= KEEPER_INTERCEPT_MIN_SPEED_MPS
+        ):
+            # Rolling toward our goal: meet the ball on its predicted path
+            # ahead of it, where a body in the way stops the attack early.
+            speed = math.hypot(vel[0], vel[1])
+            tx = bx + vel[0] / speed * INTERCEPT_LEAD_M
+            ty = by + vel[1] / speed * INTERCEPT_LEAD_M
+            self.move_to_position(clamp_inside_field(ctx, tx, ty, margin=0.3))
+            return
+
+        if ball.x < 0.0:
+            # Defending: hold the ball-to-goal lane as a second blocker.
+            along = min(DEFEND_WALL_DIST_M, max(d - 0.8, 0.0))
+        else:
+            along = min(SUPPORT_DIST_M, d)
         tx = bx + ux * along
         ty = by + uy * along
 
