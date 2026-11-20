@@ -21,7 +21,10 @@ KICK_POWER_MAX = 10.0
 # Kick power during normal play.
 KICK_POWER_DEFAULT = 5.0
 KICK_POWER_BACKFIELD = 5.0
-KICK_POWER_OUR_KICKOFF = 5.0
+
+# Soft first touch for restarts (kickoff, indirect free kick, attacking
+# throw-ins and corners): a full-power pass from the spot sails out of play.
+KICK_POWER_RESTART_PASS = 2.0
 
 
 # ======================================================================
@@ -98,6 +101,12 @@ KICKOFF_PASS_Y_M = 2.0             # First-touch pass target (field y, m)
 # Spots deep in the opponent half pass toward the nearer flank, never backward.
 SET_PLAY_PASS_AHEAD_M = 2.0
 SET_PLAY_PASS_EDGE_MARGIN_M = 1.0
+
+# Attacking restarts (our throw-in or corner in the opponent half) pass to a
+# receiver instead of shooting from the restart. The deep receiver waits at
+# the penalty spot; the short receiver sits this far along the ball-to-goal
+# lane.
+SET_PLAY_RECEIVE_DIST_M = 3.4
 
 # Opponent set plays: field boundary margin for retreat targets (m).
 OPP_SET_PLAY_FIELD_MARGIN_M = 0.3

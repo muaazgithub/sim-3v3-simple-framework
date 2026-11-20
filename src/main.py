@@ -26,7 +26,7 @@ from .framework.agent import SoccerAgentMixin
 from .framework.types import KICKING_TEAM_NONE, Context, GameState, SetPlay
 from .param import *
 from .player import Player
-from .utils import angle_to, clamp_inside_field, dist, opponent_goal, own_goal
+from .utils import angle_to, clamp, clamp_inside_field, dist, opponent_goal, own_goal
 
 
 _log = logging.getLogger(__name__)
@@ -329,7 +329,7 @@ def _act_our_kickoff(context: Context, players: list[Player], store) -> None:
         attacker.action = "kickoff:pass"
         attacker.kick(
             angle_to(0.0, 0.0, KICKOFF_PASS_X_M, KICKOFF_PASS_Y_M),
-            KICK_POWER_OUR_KICKOFF,
+            KICK_POWER_RESTART_PASS,
         )
 
     _assign_support_roles(context, attacker, players)
@@ -357,16 +357,117 @@ def _act_opp_kickoff(context: Context, players: list[Player]) -> None:
         p.walk_to(target, avoid_ball=True, avoid_robots=True)
 
 
+def _push_clear_of_ball(
+    context: Context, point: tuple[float, float], ball,
+) -> tuple[float, float]:
+    """Push a point away from the ball until it clears the inactivity radius.
+
+    Clamping near a boundary can drag a stand-off point back next to the ball,
+    where standing still draws the inactivity penalty. The point is pushed
+    along its own ball-to-point direction on whichever side stays inside the
+    field; the farther of the two results wins.
+    """
+    bx, by = ball.x, ball.y
+    if dist(point[0], point[1], bx, by) >= INACTIVITY_CLEAR_M:
+        return point
+    ux, uy = point[0] - bx, point[1] - by
+    norm = math.hypot(ux, uy)
+    if norm >= 1e-6:
+        ux, uy = ux / norm, uy / norm
+    else:
+        ux, uy = 1.0, 0.0
+    half_l = context.field.length / 2.0 - 0.3
+    half_w = context.field.width / 2.0 - 0.3
+    options = []
+    for sign in (1.0, -1.0):
+        ox = clamp(bx + sign * ux * INACTIVITY_CLEAR_M, -half_l, half_l)
+        oy = clamp(by + sign * uy * INACTIVITY_CLEAR_M, -half_w, half_w)
+        options.append((dist(ox, oy, bx, by), ox, oy))
+    # Both pushed options reach the inactivity radius unless clamping cut one
+    # short. Round the capped distance so near-ties compare equal, then prefer
+    # the upfield option on x — a one-ULP distance difference must not flip
+    # the spot behind the ball.
+    _, x, y = max(
+        options,
+        key=lambda o: (round(min(o[0], INACTIVITY_CLEAR_M), 6), o[1]),
+    )
+    return (x, y)
+
+
+def _receiver_spots(context: Context, ball) -> list[tuple[float, float]]:
+    """Deep and short receiving spots for an attacking restart.
+
+    The deep spot waits at the penalty spot; the short spot lies along the
+    ball-to-goal lane a little over 3 m from the ball. Both are clamped inside
+    the field and pushed clear of the ball so waiting there cannot draw the
+    inactivity penalty.
+    """
+    deep = clamp_inside_field(
+        context, context.field.length / 2.0 - context.field.penalty_dist, 0.0,
+        margin=0.3,
+    )
+    gx, gy = opponent_goal(context)
+    dx, dy = gx - ball.x, gy - ball.y
+    d = math.hypot(dx, dy)
+    if d >= 1e-6:
+        along = min(SET_PLAY_RECEIVE_DIST_M, max(0.5 * d, d - 1.2))
+        short = (ball.x + dx / d * along, ball.y + dy / d * along)
+    else:
+        short = deep
+    short = clamp_inside_field(context, *short, margin=0.3)
+    return [
+        _push_clear_of_ball(context, deep, ball),
+        _push_clear_of_ball(context, short, ball),
+    ]
+
+
+def _pass_to_receivers(
+    context: Context, taker: Player, players: list[Player], store,
+    origin: tuple[float, float],
+) -> None:
+    """Pass an attacking restart to a receiver waiting near the goal.
+
+    Two receivers walk to a deep spot at the penalty spot and a short spot on
+    the ball-to-goal lane; the taker passes to whichever receiver is already
+    closest to his spot, so the ball arrives as he gets there.
+    """
+    spots = _receiver_spots(context, context.ball)
+    remaining = [p for p in players if p is not taker]
+    assigned = []
+    for spot in spots:
+        if not remaining:
+            break
+        who = min(remaining, key=lambda p: _player_dist_to_position(p, spot))
+        remaining.remove(who)
+        assigned.append((who, spot))
+    if assigned:
+        _, pass_target = min(
+            assigned, key=lambda item: _player_dist_to_position(item[0], item[1]),
+        )
+    else:
+        pass_target = (KICKOFF_PASS_X_M, KICKOFF_PASS_Y_M)
+    taker.action = "setplay:pass"
+    taker.kick(
+        angle_to(origin[0], origin[1], *pass_target),
+        KICK_POWER_RESTART_PASS,
+    )
+    store.set_play_taker = taker.id
+    for who, spot in assigned:
+        who.action = "setplay:receive"
+        who.move_to_position(spot)
+
+
 def _act_our_set_play(context: Context, players: list[Player], store) -> None:
     """Dispatch our set play by type.
 
-    Direct restarts resume the normal division of labour: the taker attacks,
-    one player guards, and the rest hold safe waiting slots. ``attack()`` aims
-    at the opponent's goal, so the first touch of a throw-in, goal kick, or
-    corner never goes toward our own goal. An indirect free kick needs a
-    second touch before a goal counts, so the taker passes first and, once
-    the ball has left the spot, the nearest teammate provides the second
-    touch while the taker drops back into support.
+    Direct restarts (direct free kick, penalty, goal kick, and throw-ins or
+    corners deep in our own half) resume the normal division of labour with
+    the taker attacking: ``attack()`` aims at the opponent's goal, so the
+    first touch never goes toward our own goal. Attacking restarts —
+    throw-ins and corners in the opponent half, plus every indirect free
+    kick — pass instead of shooting: two receivers take up positions near the
+    goal and, once the ball has left the spot, the nearest teammate who is
+    not the passer takes the next touch while the passer drops into support.
     """
     if not players:
         return
@@ -396,7 +497,11 @@ def _act_our_set_play(context: Context, players: list[Player], store) -> None:
     taker = _select_closest_attacker(context, players)
     set_play = get_set_play_type(context)
 
-    if set_play != SetPlay.INDIRECT_FREE_KICK:
+    attacking = ball is not None and ball.x > 0.0
+    pass_first = set_play == SetPlay.INDIRECT_FREE_KICK or (
+        set_play in (SetPlay.CORNER_KICK, SetPlay.THROW_IN) and attacking
+    )
+    if not pass_first:
         taker.action = "attack"
         taker.attack()
         _assign_support_roles(context, taker, players)
@@ -404,40 +509,39 @@ def _act_our_set_play(context: Context, players: list[Player], store) -> None:
 
     former_taker = getattr(store, "set_play_taker", None)
     if not moved:
-        # First touch must not be a shot: pass forward of the spot.
-        if spot is not None and spot[0] >= KICKOFF_PASS_X_M:
-            pass_target = (
-                min(
-                    spot[0] + SET_PLAY_PASS_AHEAD_M,
-                    context.field.length / 2.0 - SET_PLAY_PASS_EDGE_MARGIN_M,
-                ),
-                KICKOFF_PASS_Y_M if spot[1] >= 0.0 else -KICKOFF_PASS_Y_M,
-            )
+        if attacking:
+            _pass_to_receivers(context, taker, players, store, origin)
         else:
-            pass_target = (KICKOFF_PASS_X_M, KICKOFF_PASS_Y_M)
-        taker.action = "setplay:pass"
-        taker.kick(
-            angle_to(origin[0], origin[1], *pass_target),
-            KICK_POWER_OUR_KICKOFF,
-        )
-        store.set_play_taker = taker.id
-        _assign_support_roles(context, taker, players)
+            # Indirect free kick deep in our half: a shallow forward pass,
+            # with the rest of the team holding safe positions.
+            if spot is not None and spot[0] >= KICKOFF_PASS_X_M:
+                pass_target = (
+                    min(
+                        spot[0] + SET_PLAY_PASS_AHEAD_M,
+                        context.field.length / 2.0 - SET_PLAY_PASS_EDGE_MARGIN_M,
+                    ),
+                    KICKOFF_PASS_Y_M if spot[1] >= 0.0 else -KICKOFF_PASS_Y_M,
+                )
+            else:
+                pass_target = (KICKOFF_PASS_X_M, KICKOFF_PASS_Y_M)
+            taker.action = "setplay:pass"
+            taker.kick(
+                angle_to(origin[0], origin[1], *pass_target),
+                KICK_POWER_RESTART_PASS,
+            )
+            store.set_play_taker = taker.id
+            _assign_support_roles(context, taker, players)
         return
 
     # Ball live after the pass: the passer must not re-touch before a
     # teammate does, so keep him out of attacker selection until the phase
-    # ends. The nearest other player takes the second touch while the passer
-    # and anyone left drop into support.
+    # ends. The nearest other player takes the next touch while everyone else
+    # supports behind the ball.
     candidates = [p for p in players if p.id != former_taker] or players
     striker = _select_closest_attacker(context, candidates)
     striker.action = "attack"
     striker.attack()
     rest = [p for p in players if p is not striker]
-    if rest:
-        gx, gy = own_goal(context)
-        guard = min(rest, key=lambda p: _player_dist_to_position(p, (gx, gy)))
-        guard.guard()
-        rest = [p for p in rest if p is not guard]
     for p in rest:
         p.action = "support"
         p.support()
