@@ -32,6 +32,10 @@ from .param import *
 from . import param as _param
 KEEPER_LUNGE_TIME_S = getattr(_param, "KEEPER_LUNGE_TIME_S", 1.0)
 KEEPER_JUMP_MODE = getattr(_param, "KEEPER_JUMP_MODE", None)
+# Roll calibration for distance-based kick power (meters of roll per unit of
+# kick power on this field's friction); defensive read like the constants
+# above so a stale analyzer cache cannot flag it.
+_ROLL_M_PER_POWER = getattr(_param, "KICK_ROLL_M_PER_POWER", 3.8)
 from .utils.geom import (
     angle_to,
     clamp,
@@ -95,6 +99,17 @@ def _behind_ball(
         return (ball_x, ball_y)
     ux, uy = dx / d, dy / d              # Unit vector from the ball to aim.
     return (ball_x - ux * offset, ball_y - uy * offset)   # Move away from aim.
+
+
+def _roll_power(distance: float, margin: float = 1.0) -> float:
+    """Return the kick power that rolls ``distance * margin`` meters.
+
+    Meters of roll per unit of power come from the calibration constant; the
+    margin makes the ball arrive at the target with pace instead of dying
+    short of it. Result is clamped to the firmware's power range.
+    """
+    roll = distance * margin
+    return max(KICK_POWER_MIN, min(KICK_POWER_MAX, roll / _ROLL_M_PER_POWER))
 
 
 class Player:
