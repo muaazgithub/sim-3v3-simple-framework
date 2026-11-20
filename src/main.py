@@ -194,6 +194,11 @@ class SoccerSimAgent(SoccerAgentMixin, AgentBase):
         for p in players:
             _draw_teammate_marker(p)
 
+        # Remember the ball position so the next frame can tell whether the
+        # ball is rolling; restart strikes are only re-issued on a still ball.
+        ball = context.ball
+        store.prev_ball = (ball.x, ball.y) if ball is not None else None
+
 
 def _clear_normal_sticky(store) -> None:
     store.normal_attacker = None
@@ -239,6 +244,22 @@ def _select_closest_attacker(
     ):
         return preferred[0]
     return best
+
+
+def _ball_stationary(context: Context, store) -> bool:
+    """Return whether the ball has barely moved since the previous frame.
+
+    Restart first touches re-issue ``kick()`` only while the ball is
+    stationary: re-striking a ball that is already rolling piles strike
+    distance onto strike distance and sends it out of play.
+    """
+    ball = context.ball
+    prev = getattr(store, "prev_ball", None)
+    if ball is None:
+        return False
+    if prev is None:
+        return True                   # No history yet; allow the strike.
+    return dist(ball.x, ball.y, *prev) < BALL_STILL_EPS_M
 
 
 def _assign_support_roles(context: Context, taker: Player, players: list[Player]) -> None:
@@ -322,16 +343,27 @@ def _act_our_kickoff(context: Context, players: list[Player], store) -> None:
         and dist(ball.x, ball.y, 0.0, 0.0) > KICKOFF_BALL_MOVED_M
     )
     if moved:
-        attacker.action = "kickoff:attack"
-        attacker.attack()
+        # The ball is live: the nearest player takes it, whoever that is —
+        # usually the taker chasing his own touch, sometimes the teammate it
+        # rolled to.
+        striker = _select_closest_attacker(context, players)
+        striker.action = "kickoff:attack"
+        striker.attack()
+        _assign_support_roles(context, striker, players)
+        return
+
+    if attacker.is_kicking and not _ball_stationary(context, store):
+        # A strike is already in flight; issuing kick() again would strike
+        # the moving ball a second time and pile distance onto the touch.
+        attacker.action = "kickoff:striking"
     else:
-        # First touch: a pass toward a safe forward point, never the goal.
+        # First touch: a soft pass toward a shallow forward point, never the
+        # goal.
         attacker.action = "kickoff:pass"
         attacker.kick(
             angle_to(0.0, 0.0, KICKOFF_PASS_X_M, KICKOFF_PASS_Y_M),
             KICK_POWER_RESTART_PASS,
         )
-
     _assign_support_roles(context, attacker, players)
 
 
@@ -446,11 +478,16 @@ def _pass_to_receivers(
         )
     else:
         pass_target = (KICKOFF_PASS_X_M, KICKOFF_PASS_Y_M)
-    taker.action = "setplay:pass"
-    taker.kick(
-        angle_to(origin[0], origin[1], *pass_target),
-        KICK_POWER_RESTART_PASS,
-    )
+    if taker.is_kicking and not _ball_stationary(context, store):
+        # A strike is in flight; re-striking a rolling ball compounds the
+        # touch and can send it out of play.
+        taker.action = "setplay:striking"
+    else:
+        taker.action = "setplay:pass"
+        taker.kick(
+            angle_to(origin[0], origin[1], *pass_target),
+            KICK_POWER_RESTART_PASS,
+        )
     store.set_play_taker = taker.id
     for who, spot in assigned:
         who.action = "setplay:receive"
@@ -524,11 +561,15 @@ def _act_our_set_play(context: Context, players: list[Player], store) -> None:
                 )
             else:
                 pass_target = (KICKOFF_PASS_X_M, KICKOFF_PASS_Y_M)
-            taker.action = "setplay:pass"
-            taker.kick(
-                angle_to(origin[0], origin[1], *pass_target),
-                KICK_POWER_RESTART_PASS,
-            )
+            if taker.is_kicking and not _ball_stationary(context, store):
+                # Let the in-flight strike finish before re-striking.
+                taker.action = "setplay:striking"
+            else:
+                taker.action = "setplay:pass"
+                taker.kick(
+                    angle_to(origin[0], origin[1], *pass_target),
+                    KICK_POWER_RESTART_PASS,
+                )
             store.set_play_taker = taker.id
             _assign_support_roles(context, taker, players)
         return

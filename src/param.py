@@ -18,9 +18,10 @@ import math
 KICK_POWER_MIN = 1.0
 KICK_POWER_MAX = 10.0
 
-# Kick power during normal play.
-KICK_POWER_DEFAULT = 5.0
-KICK_POWER_BACKFIELD = 5.0
+# Kick power during normal play. Values near the 10.0 cap make robots fall in
+# simulation; if players start dropping after their own kicks, lower these.
+KICK_POWER_DEFAULT = 8.0
+KICK_POWER_BACKFIELD = 9.0
 
 # Soft first touch for restarts (kickoff, indirect free kick, attacking
 # throw-ins and corners): a full-power pass from the spot sails out of play.
@@ -94,7 +95,13 @@ KICKOFF_LATERAL_TOL = 0.35
 # 0.5 m; keep margin). Until then the first touch passes instead of shooting.
 KICKOFF_BALL_MOVED_M = 0.6
 KICKOFF_PASS_X_M = 2.5             # First-touch pass target (field x, m)
-KICKOFF_PASS_Y_M = 2.0             # First-touch pass target (field y, m)
+# Shallow lateral offset: even a long low-friction roll from the spot can then
+# only leave play over the opponent end line, never the touchline.
+KICKOFF_PASS_Y_M = 1.2
+
+# A ball moving less than this between frames counts as stationary, which is
+# what allows a repeated first-touch strike; a moving ball is never re-struck.
+BALL_STILL_EPS_M = 0.05
 
 # Indirect free kick: a goal needs a second touch, so the first touch passes
 # this far forward of the spot toward this lateral offset instead of shooting.
