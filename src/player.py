@@ -332,7 +332,10 @@ class Player:
         fall back to a pass or a hopeful center shot.
         """
         ctx = self.context
-        if ctx is None or ball is None:
+        if ctx is None:
+            # Unreachable from plan_kick, which checks the context first.
+            return (0.0, 0.0), -math.inf
+        if ball is None:
             return opponent_goal(ctx), math.inf
 
         goal_x = ctx.field.length / 2.0
@@ -911,13 +914,13 @@ class Player:
         """
         ctx = self.context
         pose = self.pose
-        home = own_goal_area_center(ctx) if ctx is not None else None
-        if home is None or pose is None:
+        if ctx is None or pose is None:
             self.action = "guard:stop"
             self.stop()
             return
+        home = own_goal_area_center(ctx)
 
-        ball = ctx.ball if ctx is not None else None
+        ball = ctx.ball
         face_ball = (
             angle_to(pose.x, pose.y, ball.x, ball.y)
             if GUARD_FACE_BALL and ball is not None else 0.0
