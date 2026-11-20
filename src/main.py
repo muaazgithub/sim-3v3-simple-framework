@@ -125,6 +125,7 @@ class SoccerSimAgent(SoccerAgentMixin, AgentBase):
         store.normal_defending = False  # Hysteresis for the defensive assignment
         store.set_play_spot = None    # Ball position where the set play started
         store.set_play_taker = None   # Passer of an indirect free kick
+        store.prev_ball = None        # Previous known ball position (x, y)
         store.prev_ball_t = None      # Timestamp of the previous known ball spot
         store.ball_vel = None         # Smoothed ball velocity estimate (vx, vy)
 
@@ -208,16 +209,22 @@ class SoccerSimAgent(SoccerAgentMixin, AgentBase):
         # to suppress tracking noise. A gap longer than BALL_VEL_MAX_DT_S
         # (missed detections) invalidates the estimate. Consumers: keeper
         # shot prediction, field interception, and the shot-stillness gate.
+        # All store reads use getattr: a store persisted across a strategy
+        # reload may lack newer fields, and an exception here makes the
+        # framework stop every player for the tick — never crash the loop.
         ball = context.ball
-        now = context.now
-        prev = store.prev_ball
-        prev_t = store.prev_ball_t
+        now = getattr(context, "now", None)
+        prev = getattr(store, "prev_ball", None)
+        prev_t = getattr(store, "prev_ball_t", None)
         vel = None
-        if ball is not None and prev is not None and prev_t is not None:
+        if (
+            ball is not None and prev is not None and prev_t is not None
+            and now is not None
+        ):
             dt = now - prev_t
             if 1e-3 < dt <= BALL_VEL_MAX_DT_S:
                 raw = ((ball.x - prev[0]) / dt, (ball.y - prev[1]) / dt)
-                old = store.ball_vel
+                old = getattr(store, "ball_vel", None)
                 if old is None:
                     vel = raw
                 else:
@@ -350,7 +357,7 @@ def _act_normal(context: Context, players: list[Player], store) -> None:
         ball is not None and vel is not None and vel[0] < -INTERCEPT_MIN_VX_MPS
     )
 
-    defending = store.normal_defending
+    defending = getattr(store, "normal_defending", False)
     if ball is not None:
         if not defending and (ball.x < DEFEND_ENTER_X_M or toward_goal):
             defending = True
