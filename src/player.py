@@ -364,11 +364,39 @@ class Player:
     def _clear_plan(self, ball) -> tuple[float, float]:
         """Plan an upfield clearance biased toward the nearer open flank.
 
-        The aim point always lies ahead of the ball, so the kick direction can
-        never point back toward our own goal.
+        When a teammate sits clearly upfield with an open receiving lane, the
+        clearance becomes a distribution to their feet instead of a blind
+        hoof upfield. The aim point always lies ahead of the ball, so the
+        kick direction can never point back toward our own goal.
         """
         lateral = DEFENSE_CLEAR_LATERAL_M * (1.0 if ball.y >= 0.0 else -1.0)
         target = (ball.x + DEFENSE_CLEAR_RANGE_M, ball.y + lateral)
+
+        ctx = self.context
+        if ctx is not None:
+            best: tuple[float, tuple[float, float]] | None = None
+            for mate_id, mate in ctx.teammates.items():
+                if mate_id == self.id:
+                    continue
+                pose = mate.pose
+                if pose is None:
+                    continue
+                # Only teammates clearly upfield of the ball, with an open
+                # receiving lane, within comfortable kicking reach.
+                if pose.x < ball.x + 1.0:
+                    continue
+                if self._shot_clearance(
+                    ball, (pose.x, pose.y),
+                ) < PASS_MIN_LANE_CLEAR_M:
+                    continue
+                d = dist(ball.x, ball.y, pose.x, pose.y)
+                if d > DEFENSE_CLEAR_RANGE_M + 3.0:
+                    continue
+                if best is None or d < best[0]:
+                    best = (d, (pose.x, pose.y))
+            if best is not None:
+                target = best[1]
+
         self._draw_kick_target(target)
         return (
             angle_to(ball.x, ball.y, *target),
@@ -1119,22 +1147,23 @@ class Player:
             self._enemy_possession = False
         return self._enemy_possession
 
-    def guard(self, allow_clear: bool = True) -> None:
-        """Guard the goal, sprinting back when the opponents have the ball.
+    def guard(self, allow_clear: bool = True, sweep: bool = True) -> None:
+        """Guard the goal: intercept, sweep, clear, block.
 
-        When the ball comes within ``KEEPER_CLEAR_ENTER_M`` the keeper shoots
-        it upfield at once (``allow_clear=False`` disables this during the
-        opponents' restarts, where touching the ball early is a foul).
-        With the ball in enemy possession the keeper runs straight to the
-        goal mouth and tracks the ball's y across it, so a shot or pass
-        toward our goal meets a blocker as early as possible. Facing is only
-        imposed near the blocking spot, so the long run goes straight at
-        maximum walk speed. Away from danger the keeper waits at the
-        goal-area center, and once the ball crosses into our half
-        (hysteresis on ``GUARD_THREAT_ENTER_X`` and ``GUARD_THREAT_EXIT_X``)
-        the keeper tracks the ball across the mouth, which improves shot
-        blocking and keeps the keeper moving instead of standing inside the
-        3 m inactivity radius.
+        Priority order, highest first:
+        - ``guard:intercept``: a fast incoming shot is met at its predicted
+          goal-line crossing point, with the lunge when it is imminent.
+        - ``guard:clear``: a ball within ``KEEPER_CLEAR_ENTER_M`` is shot
+          upfield at once — the kick task walks the last stretch itself.
+        - ``guard:sweep``: a ball sitting inside our penalty area is the
+          keeper's to win — charge and clear instead of waiting on the line
+          while it sits in the most dangerous zone.
+        - ``guard:block``: enemy possession — shade the ball across the
+          goal mouth.
+        - ``guard:track`` / ``guard:home``: threat hysteresis and rest.
+
+        ``allow_clear=False`` disables clear and sweep during the opponents'
+        restarts, where touching the ball early is a foul.
         """
         ctx = self.context
         pose = self.pose
@@ -1145,34 +1174,12 @@ class Player:
         home = own_goal_area_center(ctx)
 
         ball = ctx.ball
-
-        # Ball inside the clear radius: shoot it upfield immediately — the
-        # kick task walks the last stretch itself, so this fires as soon as
-        # the ball is near. Disabled during the opponents' restarts, where
-        # touching the ball early is a foul.
-        if allow_clear and ball is not None:
-            d_ball = dist(pose.x, pose.y, ball.x, ball.y)
-            if d_ball <= (
-                KEEPER_CLEAR_EXIT_M if self._keeper_clearing
-                else KEEPER_CLEAR_ENTER_M
-            ):
-                self._keeper_clearing = True
-                self.action = "guard:clear"
-                kick_direction, kick_power = self._clear_plan(ball)
-                self.kick(kick_direction, kick_power)
-                return
-        self._keeper_clearing = False
-
-        face_ball = (
-            angle_to(pose.x, pose.y, ball.x, ball.y)
-            if GUARD_FACE_BALL and ball is not None else 0.0
-        )
+        vel = self.ball_vel
 
         # Predictive intercept: once the ball travels toward our goal fast
         # enough, sprint to where its path crosses the goal line instead of
         # chasing its current side of the mouth. Blocking means getting the
         # body onto the shot line, so the ball is not treated as an obstacle.
-        vel = self.ball_vel
         if (
             ball is not None and vel is not None
             and vel[0] < -INTERCEPT_MIN_VX_MPS
@@ -1215,11 +1222,46 @@ class Player:
                     )
                     return
             face = (
-                face_ball if dist(pose.x, pose.y, *target) <= OMNI_DIST
-                else None
+                angle_to(pose.x, pose.y, ball.x, ball.y)
+                if GUARD_FACE_BALL else 0.0
             )
-            avoid_ball = KEEPER_BLOCK_AVOID_BALL
-        elif ball is not None and self._enemy_has_ball():
+            face = face if dist(pose.x, pose.y, *target) <= OMNI_DIST else None
+            self.walk_to(
+                target, face=face, avoid_ball=KEEPER_BLOCK_AVOID_BALL,
+                avoid_robots=True,
+            )
+            return
+
+        if allow_clear and ball is not None:
+            d_ball = dist(pose.x, pose.y, ball.x, ball.y)
+            if d_ball <= (
+                KEEPER_CLEAR_EXIT_M if self._keeper_clearing
+                else KEEPER_CLEAR_ENTER_M
+            ):
+                # Ball inside the clear radius: shoot it upfield immediately
+                # — the kick task walks the last stretch itself.
+                self._keeper_clearing = True
+                self.action = "guard:clear"
+                kick_direction, kick_power = self._clear_plan(ball)
+                self.kick(kick_direction, kick_power)
+                return
+            if sweep and ball.x <= -ctx.field.length / 2.0 + ctx.field.penalty_area_length:
+                # Sweeper-keeper: a loose or held ball inside our penalty
+                # area is the keeper's to win — charge it and clear rather
+                # than waiting on the line while it sits in the most
+                # dangerous zone.
+                self._keeper_clearing = False
+                self.action = "guard:sweep"
+                self.attack()
+                return
+        self._keeper_clearing = False
+
+        face_ball = (
+            angle_to(pose.x, pose.y, ball.x, ball.y)
+            if GUARD_FACE_BALL and ball is not None else 0.0
+        )
+
+        if ball is not None and self._enemy_has_ball():
             mouth = ctx.field.goal_width / 2.0 + GUARD_TRACK_MARGIN_M
             target = clamp_inside_field(
                 ctx, home[0], clamp(ball.y, -mouth, mouth), margin=0.3,
@@ -1253,6 +1295,98 @@ class Player:
             target[0], target[1], rgb=(0.0, 0.6, 1.0), scale=0.2, ns="guard_home",
         )
         self.walk_to(target, face=face, avoid_ball=avoid_ball, avoid_robots=True)
+
+    def try_break_pass(self, advance_gain: float) -> bool:
+        """Fire one forward pass on a possession transition.
+
+        Returns whether the pass started; when it did, the kick task is live
+        and this frame must not overwrite it with another action. The pass
+        still respects the behind-the-ball gate, so a misaligned carrier
+        simply does not fire and keeps playing normally.
+        """
+        ctx = self.context
+        pose = self.pose
+        ball = ctx.ball if ctx is not None else None
+        if ctx is None or ball is None or pose is None:
+            return False
+        plan = self._pass_plan(ball, advance_gain)
+        if plan is None:
+            return False
+        kick_direction, kick_power = plan
+        ux, uy = math.cos(kick_direction), math.sin(kick_direction)
+        body_err = abs(normalize_angle(kick_direction - pose.theta))
+        ahead = (pose.x - ball.x) * ux + (pose.y - ball.y) * uy
+        if body_err <= SHOT_MAX_BODY_ERR_RAD and ahead <= SHOT_MAX_AHEAD_M:
+            self.kick(kick_direction, kick_power)
+            return True
+        return False
+
+    def cover(self) -> None:
+        """Goal-side cover while a teammate presses the ball.
+
+        Stand on the ball-to-own-goal lane a ``DEFEND_WALL_DIST_M`` short of
+        the ball, cutting the through pass or dribble behind the presser. If
+        the ball rolls toward our goal fast enough, meet it on its predicted
+        path instead. The spot is pushed outside the 3 m inactivity radius
+        when clamping drags it next to the ball.
+        """
+        ctx = self.context
+        pose = self.pose
+        ball = ctx.ball if ctx is not None else None
+        if ctx is None or ball is None or pose is None:
+            self.stop()
+            return
+
+        vel = self.ball_vel
+        if (
+            vel is not None
+            and vel[0] < -INTERCEPT_MIN_VX_MPS
+            and math.hypot(vel[0], vel[1]) >= KEEPER_INTERCEPT_MIN_SPEED_MPS
+        ):
+            # Rolling toward our goal: meet it on the predicted path.
+            speed = math.hypot(vel[0], vel[1])
+            tx = ball.x + vel[0] / speed * INTERCEPT_LEAD_M
+            ty = ball.y + vel[1] / speed * INTERCEPT_LEAD_M
+            self.move_to_position(clamp_inside_field(ctx, tx, ty, margin=0.3))
+            return
+
+        gx, gy = own_goal(ctx)
+        dx, dy = gx - ball.x, gy - ball.y
+        d = math.hypot(dx, dy)
+        if d < 1e-6:
+            ux, uy = -1.0, 0.0
+        else:
+            ux, uy = dx / d, dy / d
+        along = min(DEFEND_WALL_DIST_M, max(d - 0.8, 0.0))
+        tx = ball.x + ux * along
+        ty = ball.y + uy * along
+
+        # Stay inside the field and clear of the 3 m inactivity radius:
+        # clamping near a boundary can drag the spot next to the ball, and
+        # standing there draws a penalty.
+        half_l = ctx.field.length / 2.0
+        half_w = ctx.field.width / 2.0 - 0.3
+        tx = clamp(tx, -half_l + 0.3, half_l)
+        ty = clamp(ty, -half_w, half_w)
+        if dist(tx, ty, ball.x, ball.y) < INACTIVITY_CLEAR_M:
+            ux_t, uy_t = tx - ball.x, ty - ball.y
+            norm = math.hypot(ux_t, uy_t)
+            if norm >= 1e-6:
+                ux_t, uy_t = ux_t / norm, uy_t / norm
+            else:
+                ux_t, uy_t = -1.0, 0.0
+            options = []
+            for sign in (1.0, -1.0):
+                ox = clamp(
+                    ball.x + sign * ux_t * INACTIVITY_CLEAR_M,
+                    -half_l + 0.3, half_l,
+                )
+                oy = clamp(
+                    ball.y + sign * uy_t * INACTIVITY_CLEAR_M, -half_w, half_w,
+                )
+                options.append((dist(ox, oy, ball.x, ball.y), ox, oy))
+            _, tx, ty = max(options)
+        self.move_to_position((tx, ty))
 
     def support(self) -> None:
         """Support the ball-to-own-goal line; block the lane when defending.

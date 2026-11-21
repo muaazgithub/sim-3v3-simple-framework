@@ -380,21 +380,26 @@ def _team_possession(context: Context, store) -> bool:
 
 
 def _act_normal(context: Context, players: list[Player], store) -> None:
-    """Normal-play roles: press with one goal guard, baseline with the ball.
+    """Normal-play roles: pressure-cover defense, fast-break possession game.
 
-    The moment the ball is not in our possession — enemy control or a loose
-    ball — the two field players hunt it at once: the closest presses
-    (tackling when an opponent holds the ball) and the other chases right
-    behind, while the deepest player stays at the goal as the last line.
-    With the ball ours, the nearest player attacks, the deepest player
-    guards, and the rest support.
+    Without the ball, the shape is pressure-cover: the closest field player
+    presses the carrier, the other covers the through lane goal-side, and
+    the deepest player guards the goal — so one dribble past the presser
+    meets the cover instead of an empty net. Winning the ball triggers a
+    first-action forward pass to a better-placed teammate. With the ball
+    ours, the nearest player attacks, the deepest player guards, and the
+    rest take an advanced receiving spot.
     """
     if not players:
         return
 
-    if not _team_possession(context, store):
-        # Press with one guard: the deepest player holds the goal as the
-        # last line, the rest hunt the ball.
+    was_ours = getattr(store, "our_possession", False)
+    ours = _team_possession(context, store)
+    if not ours:
+        # Pressure-cover: the closest field player presses the ball, the
+        # other one covers the through lane goal-side, and the deepest
+        # player guards the goal. One dribble past the presser no longer
+        # means a clean run at an empty net.
         gx, gy = own_goal(context)
         goal_guard = min(
             players, key=lambda p: _player_dist_to_position(p, (gx, gy)),
@@ -403,33 +408,23 @@ def _act_normal(context: Context, players: list[Player], store) -> None:
         goal_guard.guard()
         rest = [p for p in players if p is not goal_guard]
 
-        hunter = _select_closest_attacker(context, rest) if rest else None
+        presser = _select_closest_attacker(context, rest) if rest else None
         tackle_now = _opponent_holds_ball(context)
-        ball = context.ball
-        vel = getattr(store, "ball_vel", None)
         for p in rest:
-            if p is hunter and tackle_now:
+            if p is presser and tackle_now:
                 p.action = "tackle"
                 p.tackle()
-            elif (
-                p is not hunter and ball is not None and vel is not None
-                and math.hypot(vel[0], vel[1]) >= INTERCEPT_MIN_VX_MPS
-            ):
-                # Second presser cuts the ball's path: meet it ahead of its
-                # current position, forming a pincer with the hunter.
-                speed = math.hypot(vel[0], vel[1])
-                tx = ball.x + vel[0] / speed * INTERCEPT_LEAD_M
-                ty = ball.y + vel[1] / speed * INTERCEPT_LEAD_M
-                p.action = "press:cut"
-                p.move_to_position(
-                    clamp_inside_field(context, tx, ty, margin=0.3),
-                )
-            else:
+            elif p is presser:
                 p.action = "press"
                 p.attack()
+            else:
+                p.action = "cover"
+                p.cover()
         return
 
-    # Our possession: the baseline division of labour.
+    # Our possession: the baseline division of labour, with a first-action
+    # forward pass right after winning the ball back.
+    transition = not was_ours
     attacker = _select_closest_attacker(
         context, players, getattr(store, "normal_attacker", None),
     )
@@ -437,6 +432,8 @@ def _act_normal(context: Context, players: list[Player], store) -> None:
     if _opponent_holds_ball(context):
         attacker.action = "tackle"
         attacker.tackle()
+    elif transition and attacker.try_break_pass(0.5):
+        attacker.action = "break:pass"
     else:
         attacker.action = "attack"
         attacker.attack()
