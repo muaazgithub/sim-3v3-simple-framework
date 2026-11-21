@@ -89,6 +89,17 @@ def _behind_ball(
     return (ball_x - ux * offset, ball_y - uy * offset)   # Move away from aim.
 
 
+def roll_power(distance: float, margin: float = 1.0) -> float:
+    """Return the kick power that rolls ``distance * margin`` meters.
+
+    Meters of roll per unit of power come from the calibration constant; the
+    margin makes the ball arrive at the target with pace instead of dying
+    short of it. Result is clamped to the firmware's power range.
+    """
+    roll = distance * margin
+    return max(KICK_POWER_MIN, min(KICK_POWER_MAX, roll / KICK_ROLL_M_PER_POWER))
+
+
 class Player:
     """Handle for one player. Add new skills here.
     """
@@ -118,6 +129,11 @@ class Player:
 
         # Cross-frame kick hysteresis state.
         self._kicking: bool = False
+
+        # Cross-frame pass hysteresis state: whether the current kick task is
+        # a pass, and the receiver it targets.
+        self._passing: bool = False
+        self._pass_target_id: int | None = None
 
         # Cross-frame guard hysteresis state.
         self._guard_threatened: bool = False
@@ -239,8 +255,10 @@ class Player:
         """Calculate kick direction and power.
 
         Aim from the current ball position toward ``kick_target``, which
-        defaults to the opponent's goal center. A ball deep in our end is
-        cleared upfield instead of shot. Return
+        defaults to the opponent's goal center. With the default target, a
+        shot lane blocked below ``SHOT_MIN_CLEARANCE_M`` becomes a pass to
+        the best open teammate instead of a hopeful strike into the blocker.
+        A ball deep in our end is cleared upfield instead of shot. Return
         ``(kick_direction, kick_power)``, or None when the ball or context is
         unavailable.
         """
@@ -253,7 +271,18 @@ class Player:
             return self._clear_plan(ball)
 
         if kick_target is None:
-            kick_target = self._choose_shot_target()
+            kick_target, lane_clear = self._choose_shot_target()
+            # A blocked shot becomes a pass to the best open teammate. Once
+            # passing, the lane must reopen by PASS_EXIT_MARGIN_M before
+            # shooting resumes, so the kick does not flip between shot and
+            # pass while an opponent hovers on the line.
+            exit_margin = PASS_EXIT_MARGIN_M if self._passing else 0.0
+            if lane_clear < SHOT_MIN_CLEARANCE_M + exit_margin:
+                pass_plan = self._pass_plan(ball)
+                if pass_plan is not None:
+                    return pass_plan
+            self._passing = False
+            self._pass_target_id = None
         kick_direction = angle_to(ball.x, ball.y, *kick_target)
         # The marker shows where the shot crosses the goal line, not the
         # caller's (possibly deeper) target point.
@@ -288,33 +317,100 @@ class Player:
         self._draw_kick_target(target)
         return angle_to(ball.x, ball.y, *target), KICK_POWER_BACKFIELD
 
-    def _choose_shot_target(self) -> tuple[float, float]:
+    def _choose_shot_target(
+        self,
+    ) -> tuple[tuple[float, float], float]:
         """Pick the aim point inside the opponent's goal with the most room.
 
         Candidates are the goal center and both inner-post corners. The center
         is usually covered by the keeper, so an unblocked corner wins when one
         exists; with nothing open the shot falls back to the goal center,
-        because clearing the ball matters more than placement.
+        because clearing the ball matters more than placement. Returns the
+        target and the widest clearance across all candidates, which the
+        caller uses to decide between shooting and passing.
         """
         ctx = self.context
         if ctx is None:
             # Unreachable: callers check the context before kicking.
-            return (0.0, 0.0)
+            return (0.0, 0.0), 0.0
         ball = ctx.ball
         if ball is None:
-            return opponent_goal(ctx)
+            return opponent_goal(ctx), math.inf
 
         goal_x = ctx.field.length / 2.0
         corner_y = max(ctx.field.goal_width / 2.0 - GOAL_CORNER_INSET_M, 0.0)
         candidates = [(goal_x, 0.0), (goal_x, corner_y), (goal_x, -corner_y)]
+        scored = [(t, self._shot_clearance(ball, t)) for t in candidates]
+        best_clear = max(clearance for _, clearance in scored)
         open_targets = [
-            t for t in candidates
-            if self._shot_clearance(ball, t) >= OPPONENT_RADIUS
+            t for t, clearance in scored
+            if clearance >= OPPONENT_RADIUS
             and self.kick_can_score(angle_to(ball.x, ball.y, *t))
         ]
         if not open_targets:
-            return opponent_goal(ctx)
-        return max(open_targets, key=lambda t: self._shot_clearance(ball, t))
+            return opponent_goal(ctx), best_clear
+        return max(open_targets, key=lambda t: self._shot_clearance(ball, t)), best_clear
+
+    def _pass_plan(self, ball) -> tuple[float, float] | None:
+        """Plan a pass to the best open teammate when the shot is blocked.
+
+        Candidates are teammates with known poses at least
+        ``PASS_BACKWARD_MARGIN_M`` upfield of the ball, never deep inside our
+        defensive danger zone, with a pass lane that clears every opponent by
+        ``PASS_MIN_LANE_CLEAR_M``. The current pass target is kept unless a
+        clearly closer candidate appears, so the kick direction does not flap
+        between teammates. Return ``(kick_direction, kick_power)`` or None
+        when no teammate offers an open lane.
+        """
+        ctx = self.context
+        if ctx is None:
+            return None
+
+        candidates: list[tuple[float, int, float, float]] = []
+        for mate_id, mate in ctx.teammates.items():
+            if mate_id == self.id:
+                continue
+            pose = mate.pose
+            if pose is None:
+                continue
+            # Never pass deep into our defensive danger zone: a blocked shot
+            # must not turn into a pass toward our own goal.
+            if pose.x < -ctx.field.length / 2.0 + DEFENSE_DANGER_DEPTH_M:
+                continue
+            # The pass must go upfield of the ball, never backward.
+            if pose.x < ball.x - PASS_BACKWARD_MARGIN_M:
+                continue
+            if self._shot_clearance(ball, (pose.x, pose.y)) < PASS_MIN_LANE_CLEAR_M:
+                continue
+            candidates.append((
+                dist(ball.x, ball.y, pose.x, pose.y),
+                mate_id, pose.x, pose.y,
+            ))
+        if not candidates:
+            self._pass_target_id = None
+            return None
+
+        candidates.sort()
+        chosen = candidates[0]
+        if self._pass_target_id is not None:
+            current = next(
+                (c for c in candidates if c[1] == self._pass_target_id), None,
+            )
+            if (
+                current is not None
+                and current[0] <= candidates[0][0] + PASS_TARGET_SWITCH_M
+            ):
+                chosen = current
+        self._pass_target_id = chosen[1]
+        self._passing = True
+
+        target = (chosen[2], chosen[3])
+        power = roll_power(chosen[0], PASS_ROLL_MARGIN)
+        self._draw_kick_target(target)
+        debugdraw.line(
+            [(ball.x, ball.y), target], rgb=(0.2, 0.8, 1.0), ns="pass_lane",
+        )
+        return angle_to(ball.x, ball.y, *target), power
 
     def _shot_clearance(
         self, ball, target: tuple[float, float],
@@ -760,12 +856,21 @@ class Player:
                 # Ball teleported (restart placement); not a shot.
                 vx = vy = 0.0
 
-        # Sweep: a loose ball at the mouth is cleared. A fast ball is not
-        # chased — running into a shot can deflect it in — so it falls through
-        # to the crossing-point positioning below.
+        # Sweep: a loose ball at the mouth — or anywhere in our goal area —
+        # is cleared. A fast ball is not chased — running into a shot can
+        # deflect it in — so it falls through to the crossing-point
+        # positioning below.
+        half_len = ctx.field.length / 2.0
+        in_goal_area = (
+            ball.x <= -half_len + ctx.field.goal_area_length
+            + GUARD_SWEEP_AREA_MARGIN_M
+            and abs(ball.y) <= ctx.field.goal_area_width / 2.0
+            + GUARD_SWEEP_AREA_MARGIN_M
+        )
         near = (
             dist(pose.x, pose.y, ball.x, ball.y) <= GUARD_SWEEP_M
             or dist(home[0], home[1], ball.x, ball.y) <= GUARD_SWEEP_M
+            or in_goal_area
         )
         if near and abs(vx) <= GUARD_SWEEP_MAX_MPS:
             self.action = "guard:clear"
@@ -805,9 +910,13 @@ class Player:
         self.walk_to(target, face=face, avoid_ball=True, avoid_robots=True)
 
     def support(self) -> None:
-        """Support on the ball-to-own-goal line at ``SUPPORT_DIST_M``.
+        """Support the play: block behind the ball, or receive ahead of it.
 
-        This places the player on a blocking line between the ball and our goal.
+        With the ball in our half the support stands on the ball-to-own-goal
+        line at ``SUPPORT_DIST_M``, blocking the direct route to our goal.
+        With the ball in the opponent half the support instead takes an
+        advanced receiving spot toward the opponent goal, giving the carrier
+        a forward pass option instead of waiting behind the play.
         """
         ctx = self.context
         ball = ctx.ball if ctx is not None else None
@@ -815,17 +924,36 @@ class Player:
             self.stop()
             return
 
-        gx, gy = own_goal(ctx)
         bx, by = (ball.x, ball.y)
-        dx, dy = gx - bx, gy - by
-        d = math.hypot(dx, dy)
-        if d < 1e-6:
-            ux, uy = -1.0, 0.0
+        if ball.x >= 0.0:
+            # Attacking: hold an advanced receiving spot on the ball-to-goal
+            # lane, offset laterally toward the ball's side of the field so
+            # the receiver never stands in our own shot lane.
+            gx2, gy2 = opponent_goal(ctx)
+            adx, ady = gx2 - bx, gy2 - by
+            ad = math.hypot(adx, ady)
+            if ad < 1e-6:
+                aux, auy = 1.0, 0.0
+            else:
+                aux, auy = adx / ad, ady / ad
+            along = min(ATTACK_RECEIVE_DIST_M, max(ad - 1.2, 0.0))
+            side = 1.0 if by >= 0.0 else -1.0
+            tx = bx + aux * along - auy * side * ATTACK_RECEIVE_OFFSET_M
+            ty = by + auy * along + aux * side * ATTACK_RECEIVE_OFFSET_M
+            # Keep the receiver off the opponent's goal line itself.
+            tx = min(tx, ctx.field.length / 2.0 - 0.5)
         else:
-            ux, uy = dx / d, dy / d
-        along = min(SUPPORT_DIST_M, d)
-        tx = bx + ux * along
-        ty = by + uy * along
+            # Defending: block on the line between the ball and our goal.
+            gx, gy = own_goal(ctx)
+            dx, dy = gx - bx, gy - by
+            d = math.hypot(dx, dy)
+            if d < 1e-6:
+                ux, uy = -1.0, 0.0
+            else:
+                ux, uy = dx / d, dy / d
+            along = min(SUPPORT_DIST_M, d)
+            tx = bx + ux * along
+            ty = by + uy * along
 
         # Stay 0.3 m inside our goal line and clamp laterally inside the field.
         half_l = ctx.field.length / 2.0
@@ -836,7 +964,8 @@ class Player:
         # Clamping near our goal line can pull the point back next to the ball
         # (goal kicks, pinned balls). Standing there draws the inactivity
         # penalty, so push the point away from the ball on whichever side
-        # stays inside the field.
+        # keeps it closest to the intended spot — the escape along the
+        # intended direction, not a coin-flip to the opposite side.
         if dist(tx, ty, bx, by) < INACTIVITY_CLEAR_M:
             ux_t, uy_t = tx - bx, ty - by
             norm = math.hypot(ux_t, uy_t)
@@ -852,8 +981,8 @@ class Player:
                 oy = clamp(
                     by + sign * uy_t * INACTIVITY_CLEAR_M, -half_w, half_w,
                 )
-                options.append((dist(ox, oy, bx, by), ox, oy))
-            _, tx, ty = max(options)
+                options.append((dist(ox, oy, tx, ty), ox, oy))
+            _, tx, ty = min(options)
         self.move_to_position((tx, ty))
 
     def move_to_position(self, target: tuple[float, float] | None) -> None:

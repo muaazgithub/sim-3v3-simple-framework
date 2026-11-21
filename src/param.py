@@ -58,6 +58,34 @@ DEFENSE_CLEAR_LATERAL_M = 2.0  # Clearance lateral bias toward the nearer flank
 
 
 # ======================================================================
+# Passing game
+# ======================================================================
+
+# Ball roll calibration: rough meters of roll per unit of kick power on this
+# field's friction (derived from the kickoff pass sailing out of play at
+# power 2.0). Every distance-based kick derives its power from this constant.
+KICK_ROLL_M_PER_POWER = 3.8
+# A pass rolls this much farther than the distance to its receiver, so it
+# arrives with pace instead of dying short of the receiver.
+PASS_ROLL_MARGIN = 1.1
+# The best shot lane narrower than this (m) counts as blocked: the carrier
+# looks for an open teammate instead of shooting into the blocker.
+SHOT_MIN_CLEARANCE_M = 0.75
+# Once passing, the shot lane must reopen by this extra margin (m) before
+# shooting resumes, so the kick does not flip between shot and pass while an
+# opponent hovers on the line.
+PASS_EXIT_MARGIN_M = 0.25
+# A pass lane must clear every opponent by this much (m) to be thrown.
+PASS_MIN_LANE_CLEAR_M = 0.6
+# The receiver must sit at least this far upfield of the ball (m): a blocked
+# shot never turns into a pass backward or into our own danger zone.
+PASS_BACKWARD_MARGIN_M = 0.5
+# The current pass target is kept unless a candidate appears this much (m)
+# closer, so the kick direction does not flap between teammates.
+PASS_TARGET_SWITCH_M = 0.8
+
+
+# ======================================================================
 # Player skill parameters: guarding and support
 # ======================================================================
 
@@ -73,6 +101,11 @@ GUARD_SWEEP_M = 1.5
 # Sweeps only apply to balls slower than this (m/s); a fast shot is met on its
 # crossing line instead, since running into it can deflect the ball in.
 GUARD_SWEEP_MAX_MPS = 2.0
+# Sweeper-keeper (reduced): slow balls anywhere inside our goal area — this
+# margin beyond its box — are the keeper's to clear, not just balls within
+# GUARD_SWEEP_M of the keeper or the goal-area center. Fast balls are still
+# only met on their crossing line.
+GUARD_SWEEP_AREA_MARGIN_M = 0.3
 # Shot prediction: ignore balls slower than this toward our goal, and look at
 # most this far ahead (s) when computing the crossing point.
 GUARD_PREDICT_MIN_VX_MPS = 0.3
@@ -84,6 +117,14 @@ GUARD_VELOCITY_CAP_MPS = 15.0
 # Stand-off distance from the ball. Waiting here means standing still, so keep
 # above the 3 m inactivity line with margin (see INACTIVITY_CLEAR_M).
 SUPPORT_DIST_M = 3.3
+
+# With the ball in the opponent half, the support takes an advanced receiving
+# spot this far from the ball on the ball-to-goal lane instead of standing
+# behind the play, giving the carrier a forward pass option.
+ATTACK_RECEIVE_DIST_M = 3.4
+# Lateral offset of the receiving spot (m) toward the ball's side of the
+# field, so the receiver never stands in our own shot lane.
+ATTACK_RECEIVE_OFFSET_M = 1.0
 
 # ======================================================================
 # Normal-phase strategy
