@@ -297,8 +297,10 @@ class Player:
         if kick_target is None and self._ball_in_danger():
             return self._clear_plan(ball)
 
+        lane_clear = math.inf
         if kick_target is None:
             kick_target, best_clear = self._best_shot_target(ball)
+            lane_clear = best_clear
             # Hysteresis: once passing, stay in pass mode until the shot lane
             # reopens by PASS_EXIT_MARGIN_M, so the kick task does not flip
             # between shot and pass while an opponent hovers on the line.
@@ -325,11 +327,14 @@ class Player:
         # The marker shows where the shot crosses the goal line, not the
         # caller's (possibly deeper) target point.
         self._draw_kick_target(self._goal_target_for_direction(kick_direction))
-        # Power rolls the ball exactly to the aim point (plus pace margin):
-        # on this low-friction field a fixed near-cap power sails out of play.
-        kick_power = roll_power(
-            dist(ball.x, ball.y, *kick_target), SHOT_ROLL_MARGIN,
-        )
+        shot_dist = dist(ball.x, ball.y, *kick_target)
+        if lane_clear >= SHOT_HARD_CLEARANCE_M:
+            # Clear look at the goal: the hardest shot we can fire.
+            kick_power = SHOT_MAX_POWER
+        else:
+            # Contested lane: power rolls the ball exactly to the aim point
+            # (plus pace margin) — a fixed near-cap power sails out of play.
+            kick_power = roll_power(shot_dist, SHOT_ROLL_MARGIN)
 
         return kick_direction, kick_power
 

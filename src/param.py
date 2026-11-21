@@ -190,6 +190,13 @@ KICK_ROLL_M_PER_POWER = 3.8
 SHOT_ROLL_MARGIN = 1.25
 # A pass rolls this much farther than the distance to its receiver.
 PASS_ROLL_MARGIN = 1.1
+# A wide-open shot lane clears every opponent's center by this much (m);
+# then the bot shoots as hard as it can instead of a calibrated roll.
+SHOT_HARD_CLEARANCE_M = 1.2
+# Power for the hardest shots. The firmware can fall on near-cap kicks, so
+# this sits below the 10.0 cap; raise it toward 10.0 if the sim shows no
+# falls after these shots.
+SHOT_MAX_POWER = 8.0
 
 
 # ======================================================================

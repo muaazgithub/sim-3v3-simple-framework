@@ -127,7 +127,7 @@ class SoccerSimAgent(SoccerAgentMixin, AgentBase):
         store.cur_phase = None
         store.kickoff_taker = None    # Locked taker ID, reselected for each kickoff
         store.normal_attacker = None
-        store.normal_defending = False  # Hysteresis for the defensive assignment
+        store.our_possession = False  # Hysteresis: nearest robot to the ball is ours
         store.set_play_spot = None    # Ball position where the set play started
         store.set_play_taker = None   # Passer of an indirect free kick
         store.prev_ball = None        # Previous known ball position (x, y)
@@ -344,59 +344,67 @@ def _opponent_holds_ball(context: Context) -> bool:
     return False
 
 
-def _act_normal(context: Context, players: list[Player], store) -> None:
-    """Assign roles for normal play, with a defensive keeper assignment.
+def _team_possession(context: Context, store) -> bool:
+    """Hysteresis update + return whether the nearest robot to the ball is ours.
 
-    Once the ball threatens our goal (inside our half beyond the hysteresis
-    lines, or rolling toward our goal), the player nearest our goal keeps
-    guarding and is excluded from attacker selection — a defending keeper
-    must never be pulled out of the goal by a chasing role. An opponent
-    holding the ball is tackled instead of circled.
+    The nearest-opponent-versus-nearest-teammate race decides possession with
+    a small margin, so the verdict cannot flip every frame in a 50/50 race.
+    Unknown poses are ignored; with no ball the previous verdict stands.
+    """
+    ball = context.ball
+    if ball is None:
+        return getattr(store, "our_possession", False)
+    opp_d = min(
+        (
+            dist(ball.x, ball.y, o.pose.x, o.pose.y)
+            for o in context.opponents.values() if o.pose is not None
+        ),
+        default=math.inf,
+    )
+    team_d = min(
+        (
+            dist(ball.x, ball.y, pose.x, pose.y)
+            for pose in (
+                t.pose for t in context.teammates.values() if t.pose is not None
+            )
+        ),
+        default=math.inf,
+    )
+    ours = getattr(store, "our_possession", False)
+    if team_d + GUARD_POSSESSION_MARGIN_M < opp_d:
+        ours = True
+    elif opp_d + GUARD_POSSESSION_MARGIN_M < team_d:
+        ours = False
+    store.our_possession = ours
+    return ours
+
+
+def _act_normal(context: Context, players: list[Player], store) -> None:
+    """Normal-play roles: full-team press without the ball, baseline with it.
+
+    The moment the ball is not in our possession — enemy control or a loose
+    ball — all three players, keeper included, hunt it at once: the closest
+    presses (tackling when an opponent holds the ball) and the others chase
+    right behind. With the ball ours, the nearest player attacks, the
+    deepest player guards, and the rest support.
     """
     if not players:
         return
 
-    ball = context.ball
-    vel = getattr(store, "ball_vel", None)
-    toward_goal = (
-        ball is not None and vel is not None and vel[0] < -INTERCEPT_MIN_VX_MPS
-    )
-
-    defending = getattr(store, "normal_defending", False)
-    if ball is not None:
-        if not defending and (ball.x < DEFEND_ENTER_X_M or toward_goal):
-            defending = True
-        elif defending and ball.x > DEFEND_EXIT_X_M and not toward_goal:
-            defending = False
-    store.normal_defending = defending
-
-    if defending:
-        # Defensive shape: keeper guards, nearest of the rest attacks, the
-        # remaining player supports (lane wall or interception).
-        gx, gy = own_goal(context)
-        keeper = min(players, key=lambda p: _player_dist_to_position(p, (gx, gy)))
-        keeper.action = "defend:keeper"
-        keeper.guard()
-        rest = [p for p in players if p is not keeper]
-
-        attacker = _select_closest_attacker(
-            context, rest, getattr(store, "normal_attacker", None),
-        )
-        store.normal_attacker = attacker.id
-        if _opponent_holds_ball(context):
-            attacker.action = "tackle"
-            attacker.tackle()
-        else:
-            attacker.action = "attack"
-            attacker.attack()
-        for p in rest:
-            if p is attacker:
-                continue
-            p.action = "support"
-            p.support()
+    if not _team_possession(context, store):
+        # Full press: everyone hunts the ball, keeper included.
+        hunter = _select_closest_attacker(context, players)
+        tackle_now = _opponent_holds_ball(context)
+        for p in players:
+            if p is hunter and tackle_now:
+                p.action = "tackle"
+                p.tackle()
+            else:
+                p.action = "press"
+                p.attack()
         return
 
-    # Attacking phase: the baseline division of labour.
+    # Our possession: the baseline division of labour.
     attacker = _select_closest_attacker(
         context, players, getattr(store, "normal_attacker", None),
     )
