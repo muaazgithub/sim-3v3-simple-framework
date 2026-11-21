@@ -24,16 +24,6 @@ def normalize_angle(a: float) -> float:
     return math.atan2(math.sin(a), math.cos(a))
 
 
-def deg2rad(deg: float) -> float:
-    """Convert degrees to radians."""
-    return math.radians(deg)
-
-
-def rad2deg(rad: float) -> float:
-    """Convert radians to degrees."""
-    return math.degrees(rad)
-
-
 def dist(ax: float, ay: float, bx: float, by: float) -> float:
     return math.hypot(ax - bx, ay - by)
 

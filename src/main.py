@@ -5,7 +5,7 @@ Structure, from high level to low level:
   state machine to ``_act_*`` functions. Each function selects an attacker,
   usually the player nearest the ball, and invokes Player actions directly.
 - player.py: Player control handle and high-level actions such as ``attack``,
-  ``take_kickoff``, ``move_to_position``, and ``walk_to``. Add new skills there.
+  ``move_to_position``, and ``walk_to``. Add new skills there.
 - utils/: movement, geometry, and obstacle-avoidance helpers such as
   ``opponent_goal``, ``dist``, and ``angle_to``.
 - framework/: platform plumbing that users normally do not modify.
@@ -25,18 +25,8 @@ from booster_agent_framework import AgentBase
 from .framework.agent import SoccerAgentMixin
 from .framework.types import KICKING_TEAM_NONE, Context, GameState, SetPlay
 from .param import *
-from .player import Player, roll_power
+from .player import Player
 from .utils import angle_to, clamp, clamp_inside_field, dist, opponent_goal, own_goal
-
-# Defensive read: some container-based Pyright setups analyze a stale
-# param.py and flag freshly added star-imported names as undefined.
-from . import param as _param
-KICKOFF_ROLL_DEPTH_M = getattr(_param, "KICKOFF_ROLL_DEPTH_M", 2.0)
-# Defensive throw-in ramp, ported from upstream (play-tested values).
-THROW_IN_POWER_MIN = getattr(_param, "THROW_IN_POWER_MIN", 2.5)
-THROW_IN_RAMP_M = getattr(_param, "THROW_IN_RAMP_M", 3.5)
-THROW_IN_AHEAD_M = getattr(_param, "THROW_IN_AHEAD_M", 3.0)
-THROW_IN_INWARD_M = getattr(_param, "THROW_IN_INWARD_M", 1.5)
 
 
 _log = logging.getLogger(__name__)
@@ -132,12 +122,8 @@ class SoccerSimAgent(SoccerAgentMixin, AgentBase):
         store.cur_phase = None
         store.kickoff_taker = None    # Locked taker ID, reselected for each kickoff
         store.normal_attacker = None
-        store.our_possession = False  # Hysteresis: nearest robot to the ball is ours
         store.set_play_spot = None    # Ball position where the set play started
         store.set_play_taker = None   # Passer of an indirect free kick
-        store.prev_ball = None        # Previous known ball position (x, y)
-        store.prev_ball_t = None      # Timestamp of the previous known ball spot
-        store.ball_vel = None         # Smoothed ball velocity estimate (vx, vy)
 
     @staticmethod
     def play(context: Context, players: list[Player], store) -> None:
@@ -159,13 +145,6 @@ class SoccerSimAgent(SoccerAgentMixin, AgentBase):
             f"phase={phase.value} state={game_state} set={set_play} secondary={secondary_time:.1f}",
             rgb=(1.0, 1.0, 0.0), ns="phase",
         )
-
-        # Publish the shared ball velocity estimate to every player; the
-        # keeper's shot prediction, the field interception, and the shot
-        # gate all read it.
-        ball_vel = getattr(store, "ball_vel", None)
-        for p in players:
-            p.ball_vel = ball_vel
 
         # Handle readiness and retain only players that can act this frame.
         # ensure_ready asynchronously gets up or switches to walk mode without
@@ -215,37 +194,10 @@ class SoccerSimAgent(SoccerAgentMixin, AgentBase):
         for p in players:
             _draw_teammate_marker(p)
 
-        # Estimate ball velocity from consecutive known positions, smoothed
-        # to suppress tracking noise. A gap longer than BALL_VEL_MAX_DT_S
-        # (missed detections) invalidates the estimate. Consumers: keeper
-        # shot prediction, field interception, and the shot-stillness gate.
-        # All store reads use getattr: a store persisted across a strategy
-        # reload may lack newer fields, and an exception here makes the
-        # framework stop every player for the tick — never crash the loop.
+        # Remember the ball position so the next frame can tell whether the
+        # ball is rolling; restart strikes are only re-issued on a still ball.
         ball = context.ball
-        now = getattr(context, "now", None)
-        prev = getattr(store, "prev_ball", None)
-        prev_t = getattr(store, "prev_ball_t", None)
-        vel = None
-        if (
-            ball is not None and prev is not None and prev_t is not None
-            and now is not None
-        ):
-            dt = now - prev_t
-            if 1e-3 < dt <= BALL_VEL_MAX_DT_S:
-                raw = ((ball.x - prev[0]) / dt, (ball.y - prev[1]) / dt)
-                old = getattr(store, "ball_vel", None)
-                if old is None:
-                    vel = raw
-                else:
-                    a = BALL_VEL_SMOOTHING
-                    vel = (
-                        a * raw[0] + (1.0 - a) * old[0],
-                        a * raw[1] + (1.0 - a) * old[1],
-                    )
-        store.ball_vel = vel
         store.prev_ball = (ball.x, ball.y) if ball is not None else None
-        store.prev_ball_t = now if ball is not None else None
 
 
 def _clear_normal_sticky(store) -> None:
@@ -310,145 +262,82 @@ def _ball_stationary(context: Context, store) -> bool:
     return dist(ball.x, ball.y, *prev) < BALL_STILL_EPS_M
 
 
-def _assign_support_roles(context: Context, taker: Player, players: list[Player]) -> None:
-    """Give the players other than ``taker`` a guard and safe waiting spots.
+def _wait_slots(context: Context) -> list[tuple[float, float]]:
+    """Inactivity-safe waiting points behind the play.
 
-    The player nearest our goal guards; the rest hold waiting slots outside
-    the center circle and at least ``INACTIVITY_CLEAR_M`` from the ball, so
-    standing there cannot draw the inactivity penalty.
+    Slots sit outside the center circle, in our half, and at least
+    ``INACTIVITY_CLEAR_M`` from the kickoff spot.
+    """
+    r = context.field.circle_radius
+    slot_x = -max(r + 0.5, INACTIVITY_CLEAR_M)
+    return [(slot_x, 1.8), (slot_x - 0.9, -1.8)]
+
+
+def _plan_support_roles(
+    context: Context, taker: Player, players: list[Player],
+) -> tuple[Player | None, list[tuple[Player, tuple[float, float]]]]:
+    """Choose the guard and match the other players to waiting slots.
+
+    Slots are matched nearest-first, so a pass aimed at a slot and the walk
+    toward that slot always agree on the same point.
     """
     rest = [p for p in players if p is not taker]
+    guard = None
     if rest:
         gx, gy = own_goal(context)
         guard = min(rest, key=lambda p: _player_dist_to_position(p, (gx, gy)))
-        guard.guard()
         rest = [p for p in rest if p is not guard]
+    pairs: list[tuple[Player, tuple[float, float]]] = []
+    available = _wait_slots(context)
+    for p in rest:
+        if not available:
+            break
+        slot = min(available, key=lambda t: _player_dist_to_position(p, t))
+        available.remove(slot)
+        pairs.append((p, slot))
+    return guard, pairs
 
-    r = context.field.circle_radius
-    slot_x = -max(r + 0.5, INACTIVITY_CLEAR_M)
-    slots = [(slot_x, 1.8), (slot_x - 0.9, -1.8)]
-    for p, target in zip(rest, slots):
+
+def _apply_support_roles(
+    guard: Player | None, pairs: list[tuple[Player, tuple[float, float]]],
+) -> None:
+    """Execute the guard and waiting-slot assignments."""
+    if guard is not None:
+        guard.action = "guard"
+        guard.guard()
+    for p, slot in pairs:
         p.action = "wait"
-        p.move_to_position(target)
+        p.move_to_position(slot)
 
 
-def _opponent_holds_ball(context: Context) -> bool:
-    """Return whether an opponent is close enough to the ball to be holding it.
-
-    A held ball cannot be won by circling; the attacker should tackle it.
-    """
-    ball = context.ball
-    if ball is None:
-        return False
-    for opponent in context.opponents.values():
-        pose = opponent.pose
-        if pose is None:
-            continue
-        if dist(ball.x, ball.y, pose.x, pose.y) <= OPP_BALL_HOLD_DIST_M:
-            return True
-    return False
-
-
-def _team_possession(context: Context, store) -> bool:
-    """Hysteresis update + return whether the nearest robot to the ball is ours.
-
-    The nearest-opponent-versus-nearest-teammate race decides possession with
-    a small margin, so the verdict cannot flip every frame in a 50/50 race.
-    Unknown poses are ignored; with no ball the previous verdict stands.
-    """
-    ball = context.ball
-    if ball is None:
-        return getattr(store, "our_possession", False)
-    opp_d = min(
-        (
-            dist(ball.x, ball.y, o.pose.x, o.pose.y)
-            for o in context.opponents.values() if o.pose is not None
-        ),
-        default=math.inf,
-    )
-    team_d = min(
-        (
-            dist(ball.x, ball.y, pose.x, pose.y)
-            for pose in (
-                t.pose for t in context.teammates.values() if t.pose is not None
-            )
-        ),
-        default=math.inf,
-    )
-    ours = getattr(store, "our_possession", False)
-    if team_d + GUARD_POSSESSION_MARGIN_M < opp_d:
-        ours = True
-    elif opp_d + GUARD_POSSESSION_MARGIN_M < team_d:
-        ours = False
-    store.our_possession = ours
-    return ours
+def _assign_support_roles(context: Context, taker: Player, players: list[Player]) -> None:
+    """Give the players other than ``taker`` a guard and safe waiting spots."""
+    guard, pairs = _plan_support_roles(context, taker, players)
+    _apply_support_roles(guard, pairs)
 
 
 def _act_normal(context: Context, players: list[Player], store) -> None:
-    """Normal-play roles: pressure-cover defense, fast-break possession game.
+    """Assign the nearest player to attack, the next to guard, and others to support.
 
-    Without the ball, the shape is pressure-cover: the closest field player
-    presses the carrier, the other covers the through lane goal-side, and
-    the deepest player guards the goal — so one dribble past the presser
-    meets the cover instead of an empty net. Winning the ball triggers a
-    first-action forward pass to a better-placed teammate. With the ball
-    ours, the nearest player attacks, the deepest player guards, and the
-    rest take an advanced receiving spot.
+    ``players`` contains ready players with known poses. Assign and execute
+    their roles directly here.
     """
     if not players:
         return
 
-    was_ours = getattr(store, "our_possession", False)
-    ours = _team_possession(context, store)
-    if not ours:
-        # Pressure-cover: the closest field player presses the ball, the
-        # other one covers the through lane goal-side, and the deepest
-        # player guards the goal. One dribble past the presser no longer
-        # means a clean run at an empty net.
-        gx, gy = own_goal(context)
-        goal_guard = min(
-            players, key=lambda p: _player_dist_to_position(p, (gx, gy)),
-        )
-        goal_guard.action = "guard:goal"
-        goal_guard.guard()
-        rest = [p for p in players if p is not goal_guard]
-
-        presser = _select_closest_attacker(context, rest) if rest else None
-        tackle_now = _opponent_holds_ball(context)
-        for p in rest:
-            if p is presser and tackle_now:
-                p.action = "tackle"
-                p.tackle()
-            elif p is presser:
-                p.action = "press"
-                p.attack()
-            else:
-                p.action = "cover"
-                p.cover()
-        return
-
-    # Our possession: the baseline division of labour, with a first-action
-    # forward pass right after winning the ball back.
-    transition = not was_ours
     attacker = _select_closest_attacker(
         context, players, getattr(store, "normal_attacker", None),
     )
     store.normal_attacker = attacker.id
-    if _opponent_holds_ball(context):
-        attacker.action = "tackle"
-        attacker.tackle()
-    elif transition and attacker.try_break_pass(0.5):
-        attacker.action = "break:pass"
-    else:
-        attacker.action = "attack"
-        attacker.attack()
+    attacker.action = "attack"
+    attacker.attack()
 
     # The remaining player nearest our goal becomes the guard.
     rest = [p for p in players if p is not attacker]
     if rest:
         gx, gy = own_goal(context)
         guard = min(rest, key=lambda p: _player_dist_to_position(p, (gx, gy)))
-        guard.guard()
+        guard.guard()  
         rest = [p for p in rest if p is not guard]
 
     # All other players support.
@@ -458,16 +347,15 @@ def _act_normal(context: Context, players: list[Player], store) -> None:
 
 
 def _act_our_kickoff(context: Context, players: list[Player], store) -> None:
-    """Lock the kickoff taker, roll the ball goalward, then chase and score.
+    """Lock the kickoff taker, tap the ball upfield, and keep others clear.
 
-    A goal straight from the spot does not count, so while the ball is still
-    inside ``KICKOFF_BALL_MOVED_M`` of the kickoff spot the taker plays a
-    controlled roll toward the opponent goal that stops
-    ``KICKOFF_ROLL_DEPTH_M`` short of it — power comes from the roll
-    calibration, so the touch cannot sail out of the field. Once the ball is
-    live the nearest player chases it immediately and finishes through
-    ``attack()``. Before the touch, teammates stay out of the center circle
-    and at least ``INACTIVITY_CLEAR_M`` from the ball.
+    A goal straight from kickoff does not count, so while the ball is still
+    inside ``KICKOFF_BALL_MOVED_M`` of the kickoff spot the taker taps it
+    straight upfield instead of shooting, and only chases and shoots through
+    ``attack()`` after the ball has left that radius. A straight roll cannot
+    leave play over the touchline. Before the touch, teammates stay out of the
+    center circle and at least ``INACTIVITY_CLEAR_M`` from the ball so the
+    inactivity rule cannot bite.
     """
     if not players:
         return
@@ -488,8 +376,9 @@ def _act_our_kickoff(context: Context, players: list[Player], store) -> None:
         and dist(ball.x, ball.y, 0.0, 0.0) > KICKOFF_BALL_MOVED_M
     )
     if moved:
-        # The ball is live: the nearest player chases it at once — usually
-        # the taker running after his own touch — and finishes the attack.
+        # The ball is live: the nearest player takes it, whoever that is —
+        # usually the taker chasing his own touch, sometimes the teammate it
+        # rolled to.
         striker = _select_closest_attacker(context, players)
         striker.action = "kickoff:attack"
         striker.attack()
@@ -501,17 +390,11 @@ def _act_our_kickoff(context: Context, players: list[Player], store) -> None:
         # the moving ball a second time and pile distance onto the touch.
         attacker.action = "kickoff:striking"
     else:
-        # First touch: a controlled roll goalward that stops short of the
-        # goal, setting up the chase-and-score.
-        attacker.action = "kickoff:pass"
-        origin = (ball.x, ball.y) if ball is not None else (0.0, 0.0)
-        target = (
-            context.field.length / 2.0 - KICKOFF_ROLL_DEPTH_M, 0.0,
-        )
-        attacker.kick(
-            angle_to(origin[0], origin[1], *target),
-            roll_power(dist(origin[0], origin[1], *target)),
-        )
+        # Minimal first touch: tap the ball straight upfield. A straight roll
+        # can only ever leave play over the opponent end line, never the
+        # touchline, and the taker chases it as soon as it leaves the spot.
+        attacker.action = "kickoff:tap"
+        attacker.kick(0.0, KICK_POWER_RESTART_PASS)
     _assign_support_roles(context, attacker, players)
 
 
@@ -526,8 +409,7 @@ def _act_opp_kickoff(context: Context, players: list[Player]) -> None:
         return
     gx, gy = own_goal(context)
     guard = min(players, key=lambda p: _player_dist_to_position(p, (gx, gy)))
-    # No early ball touch during the opponents' kickoff: a foul.
-    guard.guard(allow_clear=False)
+    guard.guard()
 
     rest = [p for p in players if p is not guard]
     r = context.field.circle_radius
@@ -643,15 +525,26 @@ def _pass_to_receivers(
         who.move_to_position(spot)
 
 
+def _ball_in_danger(context: Context) -> bool:
+    """Return whether the ball sits deep enough in our end to force a clearance.
+
+    Inside this zone shot staging would put a robot between the ball and our
+    goal line, so restarts switch to the staged upfield clearance instead.
+    """
+    ball = context.ball
+    if ball is None:
+        return False
+    return ball.x < -context.field.length / 2.0 + DEFENSE_DANGER_DEPTH_M
+
+
 def _throw_in_clear(context: Context, taker: Player, store) -> None:
     """Take a defensive throw-in with power scaled by depth from halfway.
 
-    Just inside our half the ball only needs to escape the press, so the
-    touch stays soft; deep in our half the throw must travel and ramps up to
-    the backfield clear power. The ball is aimed upfield and toward midfield
-    so it comes off the touchline into open grass instead of hugging the
-    side line, and a rolling ball is never struck twice.
-    (Ported from upstream, where it was play-tested and tuned.)
+    Just inside our half the ball only needs to escape the press, so the touch
+    stays soft; deep in our half the throw must travel and ramps up to the
+    backfield clear power. The ball is aimed upfield and toward midfield so it
+    comes off the touchline into open grass instead of hugging the side line,
+    and a rolling ball is never struck twice.
     """
     ball = context.ball
     if ball is None:
@@ -716,10 +609,8 @@ def _act_our_set_play(context: Context, players: list[Player], store) -> None:
     if not pass_first:
         if (
             set_play == SetPlay.THROW_IN and not attacking and ball is not None
-            and ball.x >= -context.field.length / 2.0 + DEFENSE_DANGER_DEPTH_M
+            and not _ball_in_danger(context)
         ):
-            # Defensive throw-in outside the danger zone: a directed escape
-            # into open grass instead of a full-power clear (upstream fix).
             _throw_in_clear(context, taker, store)
         else:
             taker.action = "attack"
@@ -825,8 +716,7 @@ def _pick_wall_slot(
     line_len = math.hypot(lx, ly)
     if line_len < 1e-6:
         return None
-    best: tuple[float, float] | None = None
-    best_key: tuple[float, float] | None = None
+    best, best_key = None, None
     for t in _circle_points_in_field(context, ball, radius):
         if exclude is not None and dist(t[0], t[1], *exclude) < min_separation:
             continue
@@ -836,7 +726,7 @@ def _pick_wall_slot(
             continue                      # Behind the ball blocks nothing.
         perp = abs(px * ly - py * lx) / line_len
         key = (-perp, along)
-        if best_key is None or key > best_key:
+        if best is None or key > best_key:
             best, best_key = t, key
     return best
 
@@ -920,19 +810,13 @@ def _act_opp_set_play(context: Context, players: list[Player], store) -> None:
     for kind, target in assignments:
         if not remaining:
             break
-        if kind == "guard" or target is None:
+        if kind == "guard":
             who = min(remaining, key=lambda p: _player_dist_to_position(p, (gx, gy)))
             remaining.remove(who)
             who.action = "opp_set:guard"
-            # No early ball touch during the opponents' set play: a foul.
-            who.guard(allow_clear=False)
+            who.guard()
         else:
-            # Bind the narrowed target as a default argument: Pyright does
-            # not carry loop-variable narrowing into lambda bodies.
-            who = min(
-                remaining,
-                key=lambda p, t=target: _player_dist_to_position(p, t),
-            )
+            who = min(remaining, key=lambda p: _player_dist_to_position(p, target))
             remaining.remove(who)
             _wall_move(who, context, ball, target)
 
@@ -954,8 +838,7 @@ def _act_opp_set_play(context: Context, players: list[Player], store) -> None:
             p.action = "opp_set:wait"
             p.stop()
             continue
-        px, py = pose.x, pose.y
-        target = min(points, key=lambda t: dist(px, py, *t))
+        target = min(points, key=lambda t: dist(pose.x, pose.y, *t))
         placed.append(target)
         _wall_move(p, context, ball, target)
 
