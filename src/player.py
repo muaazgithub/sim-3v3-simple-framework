@@ -297,8 +297,11 @@ class Player:
         because clearing the ball matters more than placement.
         """
         ctx = self.context
-        ball = ctx.ball if ctx is not None else None
-        if ctx is None or ball is None:
+        if ctx is None:
+            # Unreachable: callers check the context before kicking.
+            return (0.0, 0.0)
+        ball = ctx.ball
+        if ball is None:
             return opponent_goal(ctx)
 
         goal_x = ctx.field.length / 2.0
@@ -733,13 +736,13 @@ class Player:
         """
         ctx = self.context
         pose = self.pose
-        home = own_goal_area_center(ctx) if ctx is not None else None
-        if home is None or pose is None:
+        if ctx is None or pose is None:
             self.action = "guard:stop"
             self.stop()
             return
+        home = own_goal_area_center(ctx)
 
-        ball = ctx.ball if ctx is not None else None
+        ball = ctx.ball
         if ball is None:
             self._guard_prev_ball = None
             self.action = "guard:home"
