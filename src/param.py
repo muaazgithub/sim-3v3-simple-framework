@@ -282,7 +282,12 @@ SHOT_MIN_CLEARANCE_M = 0.75
 # Do not fire the kick while the planned shot direction points this far off
 # the robot's heading (radians); reposition behind the ball facing the shot
 # instead. A kick fired while facing away sends the ball backward.
-SHOT_MAX_BODY_ERR_RAD = 1.0
+SHOT_MAX_BODY_ERR_RAD = 0.6
+# The bot must also stand behind the ball relative to the shot line: fire
+# only when it sits at most this far ahead of the ball along the shot
+# direction (m). Kicking from beside or past the ball sends it wherever the
+# body points, not toward the goal.
+SHOT_MAX_AHEAD_M = 0.05
 
 # ======================================================================
 # Blocked-lane passing

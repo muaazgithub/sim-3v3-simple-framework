@@ -380,22 +380,32 @@ def _team_possession(context: Context, store) -> bool:
 
 
 def _act_normal(context: Context, players: list[Player], store) -> None:
-    """Normal-play roles: full-team press without the ball, baseline with it.
+    """Normal-play roles: press with one goal guard, baseline with the ball.
 
     The moment the ball is not in our possession — enemy control or a loose
-    ball — all three players, keeper included, hunt it at once: the closest
-    presses (tackling when an opponent holds the ball) and the others chase
-    right behind. With the ball ours, the nearest player attacks, the
-    deepest player guards, and the rest support.
+    ball — the two field players hunt it at once: the closest presses
+    (tackling when an opponent holds the ball) and the other chases right
+    behind, while the deepest player stays at the goal as the last line.
+    With the ball ours, the nearest player attacks, the deepest player
+    guards, and the rest support.
     """
     if not players:
         return
 
     if not _team_possession(context, store):
-        # Full press: everyone hunts the ball, keeper included.
-        hunter = _select_closest_attacker(context, players)
+        # Press with one guard: the deepest player holds the goal as the
+        # last line, the rest hunt the ball.
+        gx, gy = own_goal(context)
+        goal_guard = min(
+            players, key=lambda p: _player_dist_to_position(p, (gx, gy)),
+        )
+        goal_guard.action = "guard:goal"
+        goal_guard.guard()
+        rest = [p for p in players if p is not goal_guard]
+
+        hunter = _select_closest_attacker(context, rest) if rest else None
         tackle_now = _opponent_holds_ball(context)
-        for p in players:
+        for p in rest:
             if p is hunter and tackle_now:
                 p.action = "tackle"
                 p.tackle()

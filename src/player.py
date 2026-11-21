@@ -583,16 +583,18 @@ class Player:
                 self.stop()
                 return
             kick_direction, kick_power = kick_plan
+            ux, uy = math.cos(kick_direction), math.sin(kick_direction)
             body_err = abs(normalize_angle(kick_direction - pose.theta))
-            if body_err <= SHOT_MAX_BODY_ERR_RAD:
+            # Same behind-the-ball gate as attack(): the poke fires only
+            # when the body lines up behind the ball.
+            ahead = (pose.x - ball.x) * ux + (pose.y - ball.y) * uy
+            if body_err <= SHOT_MAX_BODY_ERR_RAD and ahead <= SHOT_MAX_AHEAD_M:
                 self.kick(kick_direction, kick_power)
                 return
-            # Misaligned: get behind the ball facing the poke direction.
+            # Not aligned or not behind: get behind the ball facing the poke
+            # direction.
             self.release_kick()
-            aim = (
-                ball.x + math.cos(kick_direction),
-                ball.y + math.sin(kick_direction),
-            )
+            aim = (ball.x + ux, ball.y + uy)
             chase = _behind_ball(ball.x, ball.y, aim, CHASE_BEHIND_M)
             self.walk_to(
                 clamp_inside_field(ctx, *chase, margin=CHASE_FIELD_MARGIN_M),
@@ -1017,17 +1019,21 @@ class Player:
                 self.stop()
                 return
             kick_direction, kick_power = kick_plan
+            ux, uy = math.cos(kick_direction), math.sin(kick_direction)
             body_err = abs(normalize_angle(kick_direction - pose.theta))
-            if body_err <= SHOT_MAX_BODY_ERR_RAD:
+            # Behind-the-ball gate: face along the shot line AND stand
+            # behind the ball relative to it. Kicking from beside or past
+            # the ball sends it wherever the body points, not toward the
+            # goal.
+            ahead = (pose.x - ball.x) * ux + (pose.y - ball.y) * uy
+            if body_err <= SHOT_MAX_BODY_ERR_RAD and ahead <= SHOT_MAX_AHEAD_M:
                 self.kick(kick_direction, kick_power)
                 return
-            # Misaligned: reposition behind the ball on the shot line and
-            # face the shot direction, so the next frames can fire cleanly.
+            # Not aligned or not behind: reposition behind the ball on the
+            # shot line and face the shot direction, so the next frames can
+            # fire cleanly.
             self.release_kick()
-            aim = (
-                ball.x + math.cos(kick_direction),
-                ball.y + math.sin(kick_direction),
-            )
+            aim = (ball.x + ux, ball.y + uy)
             chase = _behind_ball(ball.x, ball.y, aim, CHASE_BEHIND_M)
             self.walk_to(
                 clamp_inside_field(ctx, *chase, margin=CHASE_FIELD_MARGIN_M),
