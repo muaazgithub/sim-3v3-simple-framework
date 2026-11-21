@@ -101,7 +101,7 @@ def _behind_ball(
     return (ball_x - ux * offset, ball_y - uy * offset)   # Move away from aim.
 
 
-def _roll_power(distance: float, margin: float = 1.0) -> float:
+def roll_power(distance: float, margin: float = 1.0) -> float:
     """Return the kick power that rolls ``distance * margin`` meters.
 
     Meters of roll per unit of power come from the calibration constant; the
@@ -145,6 +145,7 @@ class Player:
         # Cross-frame block/guard hysteresis state.
         self._block_pressing: bool = False
         self._guard_threatened: bool = False
+        self._keeper_clearing: bool = False
         # Cross-frame state for driving the ball over the goal line.
         self._goal_line_push: bool = False
         # Cross-frame state for temporarily attacking when support gets stuck.
@@ -324,9 +325,10 @@ class Player:
         # The marker shows where the shot crosses the goal line, not the
         # caller's (possibly deeper) target point.
         self._draw_kick_target(self._goal_target_for_direction(kick_direction))
-        kick_power = (
-            KICK_POWER_BACKFIELD if self._ball_in_danger()
-            else KICK_POWER_DEFAULT
+        # Power rolls the ball exactly to the aim point (plus pace margin):
+        # on this low-friction field a fixed near-cap power sails out of play.
+        kick_power = roll_power(
+            dist(ball.x, ball.y, *kick_target), SHOT_ROLL_MARGIN,
         )
 
         return kick_direction, kick_power
@@ -352,7 +354,10 @@ class Player:
         lateral = DEFENSE_CLEAR_LATERAL_M * (1.0 if ball.y >= 0.0 else -1.0)
         target = (ball.x + DEFENSE_CLEAR_RANGE_M, ball.y + lateral)
         self._draw_kick_target(target)
-        return angle_to(ball.x, ball.y, *target), KICK_POWER_BACKFIELD
+        return (
+            angle_to(ball.x, ball.y, *target),
+            roll_power(dist(ball.x, ball.y, *target), SHOT_ROLL_MARGIN),
+        )
 
     def _best_shot_target(
         self, ball,
@@ -468,10 +473,7 @@ class Player:
         self._passing = True
 
         target = (chosen[2], chosen[3])
-        power = min(
-            KICK_POWER_PASS_MAX,
-            KICK_POWER_PASS_BASE + KICK_POWER_PASS_PER_M * chosen[0],
-        )
+        power = roll_power(chosen[0], PASS_ROLL_MARGIN)
         self._draw_kick_target(target)
         debugdraw.line(
             [(ball.x, ball.y), target], rgb=(0.2, 0.8, 1.0), ns="pass_lane",
@@ -1075,9 +1077,12 @@ class Player:
             self._enemy_possession = False
         return self._enemy_possession
 
-    def guard(self) -> None:
+    def guard(self, allow_clear: bool = True) -> None:
         """Guard the goal, sprinting back when the opponents have the ball.
 
+        When the ball comes within ``KEEPER_CLEAR_ENTER_M`` the keeper shoots
+        it upfield at once (``allow_clear=False`` disables this during the
+        opponents' restarts, where touching the ball early is a foul).
         With the ball in enemy possession the keeper runs straight to the
         goal mouth and tracks the ball's y across it, so a shot or pass
         toward our goal meets a blocker as early as possible. Facing is only
@@ -1098,6 +1103,24 @@ class Player:
         home = own_goal_area_center(ctx)
 
         ball = ctx.ball
+
+        # Ball inside the clear radius: shoot it upfield immediately — the
+        # kick task walks the last stretch itself, so this fires as soon as
+        # the ball is near. Disabled during the opponents' restarts, where
+        # touching the ball early is a foul.
+        if allow_clear and ball is not None:
+            d_ball = dist(pose.x, pose.y, ball.x, ball.y)
+            if d_ball <= (
+                KEEPER_CLEAR_EXIT_M if self._keeper_clearing
+                else KEEPER_CLEAR_ENTER_M
+            ):
+                self._keeper_clearing = True
+                self.action = "guard:clear"
+                kick_direction, kick_power = self._clear_plan(ball)
+                self.kick(kick_direction, kick_power)
+                return
+        self._keeper_clearing = False
+
         face_ball = (
             angle_to(pose.x, pose.y, ball.x, ball.y)
             if GUARD_FACE_BALL and ball is not None else 0.0

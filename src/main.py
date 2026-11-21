@@ -25,8 +25,13 @@ from booster_agent_framework import AgentBase
 from .framework.agent import SoccerAgentMixin
 from .framework.types import KICKING_TEAM_NONE, Context, GameState, SetPlay
 from .param import *
-from .player import Player
+from .player import Player, roll_power
 from .utils import angle_to, clamp, clamp_inside_field, dist, opponent_goal, own_goal
+
+# Defensive read: some container-based Pyright setups analyze a stale
+# param.py and flag freshly added star-imported names as undefined.
+from . import param as _param
+KICKOFF_ROLL_DEPTH_M = getattr(_param, "KICKOFF_ROLL_DEPTH_M", 2.0)
 
 
 _log = logging.getLogger(__name__)
@@ -418,14 +423,16 @@ def _act_normal(context: Context, players: list[Player], store) -> None:
 
 
 def _act_our_kickoff(context: Context, players: list[Player], store) -> None:
-    """Lock the kickoff taker, pass on the first touch, and keep others clear.
+    """Lock the kickoff taker, roll the ball goalward, then chase and score.
 
-    A goal straight from kickoff does not count, so while the ball is still
-    inside ``KICKOFF_BALL_MOVED_M`` of the kickoff spot the taker passes to a
-    forward point instead of shooting, and only chases and shoots through
-    ``attack()`` after the ball has left that radius. Before the touch,
-    teammates stay out of the center circle and at least ``INACTIVITY_CLEAR_M``
-    from the ball so the inactivity rule cannot bite.
+    A goal straight from the spot does not count, so while the ball is still
+    inside ``KICKOFF_BALL_MOVED_M`` of the kickoff spot the taker plays a
+    controlled roll toward the opponent goal that stops
+    ``KICKOFF_ROLL_DEPTH_M`` short of it — power comes from the roll
+    calibration, so the touch cannot sail out of the field. Once the ball is
+    live the nearest player chases it immediately and finishes through
+    ``attack()``. Before the touch, teammates stay out of the center circle
+    and at least ``INACTIVITY_CLEAR_M`` from the ball.
     """
     if not players:
         return
@@ -446,9 +453,8 @@ def _act_our_kickoff(context: Context, players: list[Player], store) -> None:
         and dist(ball.x, ball.y, 0.0, 0.0) > KICKOFF_BALL_MOVED_M
     )
     if moved:
-        # The ball is live: the nearest player takes it, whoever that is —
-        # usually the taker chasing his own touch, sometimes the teammate it
-        # rolled to.
+        # The ball is live: the nearest player chases it at once — usually
+        # the taker running after his own touch — and finishes the attack.
         striker = _select_closest_attacker(context, players)
         striker.action = "kickoff:attack"
         striker.attack()
@@ -460,12 +466,16 @@ def _act_our_kickoff(context: Context, players: list[Player], store) -> None:
         # the moving ball a second time and pile distance onto the touch.
         attacker.action = "kickoff:striking"
     else:
-        # First touch: a soft pass toward a shallow forward point, never the
-        # goal.
+        # First touch: a controlled roll goalward that stops short of the
+        # goal, setting up the chase-and-score.
         attacker.action = "kickoff:pass"
+        origin = (ball.x, ball.y) if ball is not None else (0.0, 0.0)
+        target = (
+            context.field.length / 2.0 - KICKOFF_ROLL_DEPTH_M, 0.0,
+        )
         attacker.kick(
-            angle_to(0.0, 0.0, KICKOFF_PASS_X_M, KICKOFF_PASS_Y_M),
-            KICK_POWER_RESTART_PASS,
+            angle_to(origin[0], origin[1], *target),
+            roll_power(dist(origin[0], origin[1], *target)),
         )
     _assign_support_roles(context, attacker, players)
 
@@ -481,7 +491,8 @@ def _act_opp_kickoff(context: Context, players: list[Player]) -> None:
         return
     gx, gy = own_goal(context)
     guard = min(players, key=lambda p: _player_dist_to_position(p, (gx, gy)))
-    guard.guard()
+    # No early ball touch during the opponents' kickoff: a foul.
+    guard.guard(allow_clear=False)
 
     rest = [p for p in players if p is not guard]
     r = context.field.circle_radius
@@ -844,7 +855,8 @@ def _act_opp_set_play(context: Context, players: list[Player], store) -> None:
             who = min(remaining, key=lambda p: _player_dist_to_position(p, (gx, gy)))
             remaining.remove(who)
             who.action = "opp_set:guard"
-            who.guard()
+            # No early ball touch during the opponents' set play: a foul.
+            who.guard(allow_clear=False)
         else:
             # Bind the narrowed target as a default argument: Pyright does
             # not carry loop-variable narrowing into lambda bodies.

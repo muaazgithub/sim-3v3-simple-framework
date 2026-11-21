@@ -104,6 +104,12 @@ KICKOFF_PASS_X_M = 2.5             # First-touch pass target (field x, m)
 # only leave play over the opponent end line, never the touchline.
 KICKOFF_PASS_Y_M = 1.2
 
+# Kickoff first touch: roll the ball this far in front of the opponent goal
+# line, then chase it immediately and shoot. Power derives from the roll
+# calibration constant, so the touch always stops short instead of sailing
+# out of the field like a fixed-power kick does.
+KICKOFF_ROLL_DEPTH_M = 2.0
+
 # A ball moving less than this between frames counts as stationary, which is
 # what allows a repeated first-touch strike; a moving ball is never re-struck.
 BALL_STILL_EPS_M = 0.05
@@ -154,24 +160,45 @@ BALL_VEL_MAX_DT_S = 0.4
 
 # Only shoot when the ball is within this fraction of the field length from
 # the opponent goal center; farther out, dribble or pass instead.
-SHOOT_MAX_RANGE_FRAC = 0.55
+SHOOT_MAX_RANGE_FRAC = 0.7
 # Only shoot when the ball-to-goal direction stays within this angle of the
 # +x axis (radians); acute side angles produce wild shots.
-SHOOT_MAX_ANGLE_RAD = 0.9
+SHOOT_MAX_ANGLE_RAD = 1.1
 # Do not commit to a shot while the ball moves faster than this (m/s); a kick
 # on a fast rolling ball goes anywhere.
-SHOT_MAX_BALL_SPEED_MPS = 1.0
+SHOT_MAX_BALL_SPEED_MPS = 1.8
+# A shot counts as open only when its line clears every opponent's center by
+# this much (OPPONENT_RADIUS plus margin for kick-direction error).
+SHOT_MIN_CLEARANCE_M = 0.6
 
 # Keep the latched aim seam unless another candidate is clearly wider (m).
 AIM_SWITCH_MARGIN_M = 0.3
 
 
 # ======================================================================
+# Kick power calibration
+# ======================================================================
+
+# Ball roll calibration: rough meters of roll per unit of kick power on this
+# field's friction. Derived from the kickoff pass sailing out of play at
+# power 2.0 (the end line sits 7.6 m away on that diagonal, so power 2.0
+# rolls at least that far). Every distance-based kick derives its power from
+# this constant; tune it after watching touch distances in Studio.
+KICK_ROLL_M_PER_POWER = 3.8
+# A shot rolls this much farther than the distance to its target, so it
+# arrives with pace instead of dying short of the goal line.
+SHOT_ROLL_MARGIN = 1.25
+# A pass rolls this much farther than the distance to its receiver.
+PASS_ROLL_MARGIN = 1.1
+
+
+# ======================================================================
 # Dribbling
 # ======================================================================
 
-# Soft kick power for dribble touches; harder kicks lose control of the ball.
-KICK_POWER_DRIBBLE = 3.0
+# Soft kick power for dribble touches; on this field even the minimum power
+# rolls several meters, so dribbling is push-chase rather than close control.
+KICK_POWER_DRIBBLE = 1.0
 # A dribble direction must clear obstacles by this much over PLAN_LOOKAHEAD (m).
 DRIBBLE_CLEARANCE_M = 0.45
 
@@ -202,6 +229,11 @@ DEFEND_WALL_DIST_M = 3.4
 # The keeper predicts the ball path and sprints to its goal-line crossing
 # point once the ball moves toward our goal at least this fast (m/s).
 KEEPER_INTERCEPT_MIN_SPEED_MPS = 1.2
+# When the ball comes this close, the keeper clears it upfield at once (m):
+# the enter radius, and the wider exit radius with hysteresis so an
+# in-flight clearance is not aborted while the ball is still nearby.
+KEEPER_CLEAR_ENTER_M = 1.5
+KEEPER_CLEAR_EXIT_M = 2.0
 # Whether the keeper models the ball as an obstacle while blocking. False:
 # getting the body onto the shot line is the job, so the keeper walks into
 # the ball's path instead of steering around it.
