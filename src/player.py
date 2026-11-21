@@ -36,6 +36,10 @@ KEEPER_JUMP_MODE = getattr(_param, "KEEPER_JUMP_MODE", None)
 # kick power on this field's friction); defensive read like the constants
 # above so a stale analyzer cache cannot flag it.
 _ROLL_M_PER_POWER = getattr(_param, "KICK_ROLL_M_PER_POWER", 3.8)
+_ATTACK_RECEIVE_DIST_M = getattr(_param, "ATTACK_RECEIVE_DIST_M", 3.4)
+_ATTACK_RECEIVE_OFFSET_M = getattr(_param, "ATTACK_RECEIVE_OFFSET_M", 1.0)
+_PASS_ADVANCE_GAIN_M = getattr(_param, "PASS_ADVANCE_GAIN_M", 1.5)
+_DRIBBLE_ROLL_M = _ROLL_M_PER_POWER * KICK_POWER_DRIBBLE
 from .utils.geom import (
     angle_to,
     clamp,
@@ -315,6 +319,13 @@ class Player:
                     pass_plan = self._pass_plan(ball)
                     if pass_plan is not None:
                         return pass_plan
+                elif not self._shot_allowed(ball):
+                    # Out of range/angle or the ball still moving: a pass to
+                    # a decisively better-placed teammate beats a slow
+                    # dribble upfield.
+                    pass_plan = self._pass_plan(ball, _PASS_ADVANCE_GAIN_M)
+                    if pass_plan is not None:
+                        return pass_plan
                 self._passing = False
                 dribble_plan = self._dribble_plan(ball)
                 if dribble_plan is not None:
@@ -424,21 +435,28 @@ class Player:
         self._aim_target = None
         return opponent_goal(ctx), max(best_clear, 0.0)
 
-    def _pass_plan(self, ball) -> tuple[float, float] | None:
+    def _pass_plan(
+        self, ball, advance_gain: float = 0.0,
+    ) -> tuple[float, float] | None:
         """Plan a pass to the best open teammate when the shot is blocked.
 
         Candidates are teammates with known poses at least
         ``PASS_BACKWARD_MARGIN_M`` upfield of the ball, never deep inside our
         defensive danger zone, with a pass lane that clears every opponent by
-        ``PASS_MIN_LANE_CLEAR_M``. The current pass target is kept unless a
-        clearly closer candidate appears, so the kick direction does not flap
-        between teammates. Return ``(kick_direction, kick_power)`` or None
-        when no teammate offers an open lane.
+        ``PASS_MIN_LANE_CLEAR_M``. With ``advance_gain`` above zero the
+        receiver must also sit that much closer to the opponent goal than
+        the ball, which turns the pass into a decisive forward ball. The
+        current pass target is kept unless a clearly closer candidate
+        appears, so the kick direction does not flap between teammates.
+        Return ``(kick_direction, kick_power)`` or None when no teammate
+        offers an open lane.
         """
         ctx = self.context
         if ctx is None:
             return None
 
+        goal_x = ctx.field.length / 2.0
+        ball_goal_d = dist(ball.x, ball.y, goal_x, 0.0)
         candidates: list[tuple[float, int, float, float]] = []
         for mate_id, mate in ctx.teammates.items():
             if mate_id == self.id:
@@ -452,6 +470,10 @@ class Player:
                 continue
             # The pass must go upfield of the ball, never backward.
             if pose.x < ball.x - PASS_BACKWARD_MARGIN_M:
+                continue
+            if advance_gain > 0.0 and dist(
+                pose.x, pose.y, goal_x, 0.0,
+            ) > ball_goal_d - advance_gain:
                 continue
             if self._shot_clearance(ball, (pose.x, pose.y)) < PASS_MIN_LANE_CLEAR_M:
                 continue
@@ -527,6 +549,15 @@ class Player:
             ctx, self.id, ball=False, robots=True, goals=False,
         )
 
+        def _poke_stays_in(heading: float) -> bool:
+            # One touch rolls roughly DRIBBLE_ROLL_M; a poke whose landing
+            # point leaves the field hands the ball back to the opponents.
+            end_x = ball.x + math.cos(heading) * _DRIBBLE_ROLL_M
+            end_y = ball.y + math.sin(heading) * _DRIBBLE_ROLL_M
+            return (end_x, end_y) == clamp_inside_field(
+                ctx, end_x, end_y, margin=0.3,
+            )
+
         plus_h: float | None = None
         minus_h: float | None = None
         k = 1
@@ -534,11 +565,11 @@ class Player:
             offset = k * PLAN_STEP
             if plus_h is None and _heading_clearance(
                 ball.x, ball.y, goal_dir + offset, obstacles,
-            ) >= DRIBBLE_CLEARANCE_M:
+            ) >= DRIBBLE_CLEARANCE_M and _poke_stays_in(goal_dir + offset):
                 plus_h = goal_dir + offset
             if minus_h is None and _heading_clearance(
                 ball.x, ball.y, goal_dir - offset, obstacles,
-            ) >= DRIBBLE_CLEARANCE_M:
+            ) >= DRIBBLE_CLEARANCE_M and _poke_stays_in(goal_dir - offset):
                 minus_h = goal_dir - offset
             if plus_h is not None and minus_h is not None:
                 break
@@ -1265,10 +1296,27 @@ class Player:
         if ball.x < 0.0:
             # Defending: hold the ball-to-goal lane as a second blocker.
             along = min(DEFEND_WALL_DIST_M, max(d - 0.8, 0.0))
+            tx = bx + ux * along
+            ty = by + uy * along
         else:
-            along = min(SUPPORT_DIST_M, d)
-        tx = bx + ux * along
-        ty = by + uy * along
+            # Attacking: take an advanced receiving spot on the ball-to-goal
+            # lane (toward the OPPONENT goal), offset laterally toward the
+            # ball's side of the field so the receiver never stands in our
+            # own shot lane. This gives the carrier a forward pass option
+            # instead of waiting behind the play.
+            gx2, gy2 = opponent_goal(ctx)
+            adx, ady = gx2 - bx, gy2 - by
+            ad = math.hypot(adx, ady)
+            if ad < 1e-6:
+                aux, auy = 1.0, 0.0
+            else:
+                aux, auy = adx / ad, ady / ad
+            along = min(_ATTACK_RECEIVE_DIST_M, max(ad - 1.2, 0.0))
+            side = 1.0 if by >= 0.0 else -1.0
+            tx = bx + aux * along - auy * side * _ATTACK_RECEIVE_OFFSET_M
+            ty = by + auy * along + aux * side * _ATTACK_RECEIVE_OFFSET_M
+            # Keep the receiver off the opponent's goal line itself.
+            tx = min(tx, ctx.field.length / 2.0 - 0.5)
 
         # Stay 0.3 m inside our goal line and clamp laterally inside the field.
         half_l = ctx.field.length / 2.0

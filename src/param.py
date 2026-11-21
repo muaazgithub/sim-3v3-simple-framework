@@ -198,6 +198,22 @@ SHOT_HARD_CLEARANCE_M = 1.2
 # falls after these shots.
 SHOT_MAX_POWER = 8.0
 
+# ======================================================================
+# Attacking support and forward passing
+# ======================================================================
+
+# With the ball in the opponent half, the support takes this advanced
+# receiving spot on the ball-to-goal lane (m from the ball), giving the
+# carrier a forward pass option instead of standing behind the play.
+ATTACK_RECEIVE_DIST_M = 3.4
+# Lateral offset of the receiving spot (m) toward the ball's side of the
+# field, so the receiver never stands in our own shot lane.
+ATTACK_RECEIVE_OFFSET_M = 1.0
+# A forward pass out of shooting range fires only when the receiver is at
+# least this much closer to the opponent goal than the ball is (m); without
+# a decisive gain the carrier keeps dribbling.
+PASS_ADVANCE_GAIN_M = 1.5
+
 
 # ======================================================================
 # Dribbling

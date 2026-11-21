@@ -405,10 +405,25 @@ def _act_normal(context: Context, players: list[Player], store) -> None:
 
         hunter = _select_closest_attacker(context, rest) if rest else None
         tackle_now = _opponent_holds_ball(context)
+        ball = context.ball
+        vel = getattr(store, "ball_vel", None)
         for p in rest:
             if p is hunter and tackle_now:
                 p.action = "tackle"
                 p.tackle()
+            elif (
+                p is not hunter and ball is not None and vel is not None
+                and math.hypot(vel[0], vel[1]) >= INTERCEPT_MIN_VX_MPS
+            ):
+                # Second presser cuts the ball's path: meet it ahead of its
+                # current position, forming a pincer with the hunter.
+                speed = math.hypot(vel[0], vel[1])
+                tx = ball.x + vel[0] / speed * INTERCEPT_LEAD_M
+                ty = ball.y + vel[1] / speed * INTERCEPT_LEAD_M
+                p.action = "press:cut"
+                p.move_to_position(
+                    clamp_inside_field(context, tx, ty, margin=0.3),
+                )
             else:
                 p.action = "press"
                 p.attack()
