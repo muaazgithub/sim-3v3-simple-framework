@@ -120,6 +120,17 @@ BALL_STILL_EPS_M = 0.05
 SET_PLAY_PASS_AHEAD_M = 2.0
 SET_PLAY_PASS_EDGE_MARGIN_M = 1.0
 
+# Defensive throw-in: the power ramps with depth in our half. Near the halfway
+# line the ball only needs to escape the press, so the touch stays soft; deep
+# in our half it must travel, ramping up to the backfield clear power.
+# Values ported from upstream, where they were play-tested and tuned.
+THROW_IN_POWER_MIN = 2.5
+THROW_IN_RAMP_M = 3.5
+# Aim this far upfield and this far toward midfield, so the ball comes off the
+# touchline into open grass instead of hugging the side line.
+THROW_IN_AHEAD_M = 3.0
+THROW_IN_INWARD_M = 1.5
+
 # Attacking restarts (our throw-in or corner in the opponent half) pass to a
 # receiver instead of shooting from the restart. The deep receiver waits at
 # the penalty spot; the short receiver sits this far along the ball-to-goal

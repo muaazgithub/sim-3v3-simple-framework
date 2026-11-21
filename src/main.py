@@ -32,6 +32,11 @@ from .utils import angle_to, clamp, clamp_inside_field, dist, opponent_goal, own
 # param.py and flag freshly added star-imported names as undefined.
 from . import param as _param
 KICKOFF_ROLL_DEPTH_M = getattr(_param, "KICKOFF_ROLL_DEPTH_M", 2.0)
+# Defensive throw-in ramp, ported from upstream (play-tested values).
+THROW_IN_POWER_MIN = getattr(_param, "THROW_IN_POWER_MIN", 2.5)
+THROW_IN_RAMP_M = getattr(_param, "THROW_IN_RAMP_M", 3.5)
+THROW_IN_AHEAD_M = getattr(_param, "THROW_IN_AHEAD_M", 3.0)
+THROW_IN_INWARD_M = getattr(_param, "THROW_IN_INWARD_M", 1.5)
 
 
 _log = logging.getLogger(__name__)
@@ -638,6 +643,32 @@ def _pass_to_receivers(
         who.move_to_position(spot)
 
 
+def _throw_in_clear(context: Context, taker: Player, store) -> None:
+    """Take a defensive throw-in with power scaled by depth from halfway.
+
+    Just inside our half the ball only needs to escape the press, so the
+    touch stays soft; deep in our half the throw must travel and ramps up to
+    the backfield clear power. The ball is aimed upfield and toward midfield
+    so it comes off the touchline into open grass instead of hugging the
+    side line, and a rolling ball is never struck twice.
+    (Ported from upstream, where it was play-tested and tuned.)
+    """
+    ball = context.ball
+    if ball is None:
+        taker.stop()
+        return
+    ratio = clamp(max(0.0, -ball.x) / THROW_IN_RAMP_M, 0.0, 1.0)
+    power = THROW_IN_POWER_MIN + (KICK_POWER_BACKFIELD - THROW_IN_POWER_MIN) * ratio
+    inward = THROW_IN_INWARD_M * (1.0 if ball.y >= 0.0 else -1.0)
+    target = (ball.x + THROW_IN_AHEAD_M, ball.y + inward)
+    if taker.is_kicking and not _ball_stationary(context, store):
+        # A strike is in flight; re-striking a rolling ball compounds it.
+        taker.action = "throwin:striking"
+    else:
+        taker.action = "throwin:clear"
+        taker.kick(angle_to(ball.x, ball.y, *target), power)
+
+
 def _act_our_set_play(context: Context, players: list[Player], store) -> None:
     """Dispatch our set play by type.
 
@@ -683,8 +714,16 @@ def _act_our_set_play(context: Context, players: list[Player], store) -> None:
         set_play in (SetPlay.CORNER_KICK, SetPlay.THROW_IN) and attacking
     )
     if not pass_first:
-        taker.action = "attack"
-        taker.attack()
+        if (
+            set_play == SetPlay.THROW_IN and not attacking and ball is not None
+            and ball.x >= -context.field.length / 2.0 + DEFENSE_DANGER_DEPTH_M
+        ):
+            # Defensive throw-in outside the danger zone: a directed escape
+            # into open grass instead of a full-power clear (upstream fix).
+            _throw_in_clear(context, taker, store)
+        else:
+            taker.action = "attack"
+            taker.attack()
         _assign_support_roles(context, taker, players)
         return
 
